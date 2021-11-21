@@ -3,12 +3,17 @@
 
 ## General
 
-- [ ] Write "restore time" calculator based on function deps
-- [ ] Write Similarity Function
-- [ ] Create function data generator
-  - [ ] Fully-random generator
-  - [ ] Package-Frequency aware generator
-- [ ] Write the Synthetic Data Generator
+- [ ] Implement "restore time" calculator based on function deps
+- [x] Implement Russuan Roullete
+- [ ] Implement Similarity Function
+- [x] Create function data generator
+  - [x] Fully-random generator
+    - [x] Uniform Dist
+    - [x] Normal Dist
+  - [x] Package-Frequency aware generator
+    - [x] Uniform Dist
+    - [x] Normal Dist
+- [ ] Implement the Synthetic Data Generator
   - [ ] Random Invocation time generator
   - [ ] Invocation Frequency aware generator
 - [ ] Massure approaches by
@@ -31,7 +36,6 @@ Wait for 5 mins after function terminates
 
 ## Dynamic-Wait Approach (this paper)
 
-- [ ] Create function data generator using `packageData` folder
 - [ ] Create coop network
   - [ ] Weight Evaporation
   - [ ] Co-op probability calculator
