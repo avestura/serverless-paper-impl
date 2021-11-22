@@ -185,8 +185,8 @@ module QueueFunctionGenerateOption =
 
 type QueueFunctionRequest = {
     func: ServerlessFunction
-    startTime: Duration
-    serviceTime: LocalTime
+    startTime: LocalTime
+    serviceTime: Duration
 }
 
 module QueueDataGenerator =
