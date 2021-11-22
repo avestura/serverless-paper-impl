@@ -1,7 +1,9 @@
-# Todo
+# Serverless Paper Impl
 
+My masters paper impl
 
-## General
+## Tasks
+### General
 
 - [ ] Implement "restore time" calculator based on function deps
 - [x] Implement Russuan Roullete
@@ -22,26 +24,26 @@
   - [ ] Throughput
   - [ ] Response/Cost Ratio
 
-### No-Merge approach
+#### No-Merge approach
 
 Terminate container after function terminates
 
-## Random-Wait Approach
+### Random-Wait Approach
 
 Wait for a random time after function terminates
 
-## Static-Wait Approach
+### Static-Wait Approach
 
 Wait for 5 mins after function terminates
 
-## Dynamic-Wait Approach (this paper)
+### Dynamic-Wait Approach (this paper)
 
 - [ ] Create coop network
   - [ ] Weight Evaporation
   - [ ] Co-op probability calculator
 
 
-### Statistical Distributions
+## Statistical Distributions
 
 - Normalaizer: Weilbul
 - Number of Function dependencies: Normal, u = 50, stddev = 15
