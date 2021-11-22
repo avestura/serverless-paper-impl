@@ -9,9 +9,17 @@ open System
 open System.IO
 open System.Text.Json
 open FSharp.Data
+open Microsoft.FSharp.Data.UnitSystems.SI.UnitNames
 
 module General =
     let rnd = Random()
+
+    let NumberOfFunctionDeps_DefaultNormalDistMean = 50
+    let NumberOfFunctionDeps_DefaultNormalDistStdDev = 15
+
+    let FunctionDuration_MaxRuntimeDuration = 300<second>
+    let FunctionDuration_DefaultChiSquareFreedom = 2.1
+    let FunctionDuration_MinRuntimeDuration = 2.0<second>
 
 
 module DSExtensions =
@@ -110,32 +118,26 @@ type ServerlessFunction = {
     deps: string list
 }
 
-type QueueFunctionRequest = {
-    func: ServerlessFunction
-    startTime: Duration
-    serviceTime: LocalTime
-}
-
-module GenerateOptions =
+module FunctionGenerateOptions =
     type FrequencyGenerationMode = IgnoreFrequencyData | UseFrequencyData
     type Frequencies = FrequencyGenerationMode * Map<string,Map<int,int>> option
 
     type Dependencies =
         | DataUnawareRandomUniform of n : int
-        | DataUnawareRandomNormal of mean : int * stddev: int // 50, 15
+        | DataUnawareRandomNormal of mean : int * stddev: int
         | DataAwareRandomUniform of data : Map<string,int> option * n : int
         | DataAwareRandomNormal of data : Map<string, int> option * n : int * stddev : int
 
 module FunctionGenerator =
     open General
-    open GenerateOptions
+    open FunctionGenerateOptions
     open DSExtensions
     open MathNet.Numerics.Distributions
     let getNRandomPackageNames n = 
         let allNames = PackagesData.packageNames
         allNames |> Array.sortBy(fun _ -> rnd.Next()) |> Array.take n
 
-    let generateFunctionData (deps: GenerateOptions.Dependencies) n =
+    let generateFunctionData (deps: FunctionGenerateOptions.Dependencies) n =
         match deps with
         | DataUnawareRandomUniform c ->
             let nNames = getNRandomPackageNames c
@@ -178,4 +180,26 @@ module FunctionGenerator =
                 deps = probData |> takeNFromProbMap c
             })
 
-    let generateFunctionQueueData () = 0
+module QueueFunctionGenerateOption = 
+    type X = int
+
+type QueueFunctionRequest = {
+    func: ServerlessFunction
+    startTime: Duration
+    serviceTime: LocalTime
+}
+
+module QueueDataGenerator =
+    open QueueFunctionGenerateOption
+    open General
+    open FunctionGenerator
+    open DSExtensions
+    open MathNet.Numerics.Distributions
+    let generateFunctionDuration() = 
+        let chi = Sample.chiSquared 2.1 rnd |> (*) 30.0<second> 
+        let min = FunctionDuration_MinRuntimeDuration
+        if chi < min then min else chi
+
+    let generateFunctionQueueData () = 
+        0
+        

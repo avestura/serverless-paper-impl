@@ -39,3 +39,10 @@ Wait for 5 mins after function terminates
 - [ ] Create coop network
   - [ ] Weight Evaporation
   - [ ] Co-op probability calculator
+
+
+### Statistical Distributions
+
+- Normalaizer: Weilbul
+- Number of Function dependencies: Normal, u = 50, stddev = 15
+- Function Duration: Chi-Square, v = 2.1
