@@ -18,6 +18,7 @@ My masters paper impl
 - [ ] Implement the Synthetic Data Generator
   - [ ] Random Invocation time generator
   - [ ] Invocation Frequency aware generator
+- [ ] Write the event simulator based on synthetic generator
 - [ ] Massure approaches by
   - [ ] Response time
   - [ ] Cost
@@ -48,3 +49,4 @@ Wait for 5 mins after function terminates
 - Normalaizer: Weilbul
 - Number of Function dependencies: Normal, u = 50, stddev = 15
 - Function Duration: Chi-Square, v = 2.1
+- Function Run Request Every: Normal, u = 30, stddev = 10

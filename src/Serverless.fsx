@@ -119,9 +119,6 @@ type ServerlessFunction = {
 }
 
 module FunctionGenerateOptions =
-    type FrequencyGenerationMode = IgnoreFrequencyData | UseFrequencyData
-    type Frequencies = FrequencyGenerationMode * Map<string,Map<int,int>> option
-
     type Dependencies =
         | DataUnawareRandomUniform of n : int
         | DataUnawareRandomNormal of mean : int * stddev: int
@@ -180,8 +177,20 @@ module FunctionGenerator =
                 deps = probData |> takeNFromProbMap c
             })
 
-module QueueFunctionGenerateOption = 
-    type X = int
+module QueueFunctionGeneration = 
+    type DayOfWeekName = string
+    type FreqHour = int
+
+    type FunctionInvokeMode =
+        | IgnoreCoopNetwork
+        | UseCoopNetwork
+
+    type FrequencyGenerationMode = 
+        | IgnoreFrequencyData
+        | UseFrequencyData of Map<DayOfWeekName,Map<FreqHour,int>>
+
+    type Options = FrequencyGenerationMode * FunctionInvokeMode
+
 
 type QueueFunctionRequest = {
     func: ServerlessFunction
@@ -190,7 +199,6 @@ type QueueFunctionRequest = {
 }
 
 module QueueDataGenerator =
-    open QueueFunctionGenerateOption
     open General
     open FunctionGenerator
     open DSExtensions
@@ -200,6 +208,14 @@ module QueueDataGenerator =
         let min = FunctionDuration_MinRuntimeDuration
         if chi < min then min else chi
 
-    let generateFunctionQueueData () = 
-        0
+    let getNextFunctionRequestTime () =
+        Sample.normal 30.0 10.0 rnd |> abs |> ceil |> int64 |> (*) 1L<second>
+
+    let generateFunctionQueueData (options: QueueFunctionGeneration.Options) = 
+        let rec generate (currentTime: LocalTime) (result: QueueFunctionRequest list) =
+            let secsToAdd = getNextFunctionRequestTime() * (1L<1/second>)
+            let startTime = LocalTime(0,0,0).PlusSeconds(secsToAdd)
+            0
+
+        generate (LocalTime(0,0,0)) []
         
