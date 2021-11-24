@@ -21,6 +21,9 @@ module General =
     let FunctionDuration_DefaultChiSquareFreedom = 2.1
     let FunctionDuration_MinRuntimeDuration = 2.0<second>
 
+    let FunctionRunRequestEvery_NormalMean = 30.0<second>
+    let FunctionRunRequestEvery_NormalStdDev = 10.0<second>
+
 
 module DSExtensions =
     open General
@@ -209,7 +212,9 @@ module QueueDataGenerator =
         if chi < min then min else chi
 
     let getNextFunctionRequestTime () =
-        Sample.normal 30.0 10.0 rnd |> abs |> ceil |> int64 |> (*) 1L<second>
+        let m = FunctionRunRequestEvery_NormalMean |> (*) 1.0<1/second>
+        let s = FunctionRunRequestEvery_NormalStdDev |> (*) 1.0<1/second>
+        Sample.normal m s rnd |> abs |> ceil |> int64 |> (*) 1L<second>
 
     let generateFunctionQueueData (options: QueueFunctionGeneration.Options) = 
         let rec generate (currentTime: LocalTime) (result: QueueFunctionRequest list) =
