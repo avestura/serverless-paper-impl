@@ -121,8 +121,13 @@ type ServerlessFunction = {
     deps: string list
 }
 
+type EnvironmentContext = {
+    currentDayOfWeek: string
+    currentTime: LocalTime
+}
+
 module FunctionGenerateOptions =
-    type Dependencies =
+    type DependenciesCount =
         | DataUnawareRandomUniform of n : int
         | DataUnawareRandomNormal of mean : int * stddev: int
         | DataAwareRandomUniform of data : Map<string,int> option * n : int
@@ -137,7 +142,7 @@ module FunctionGenerator =
         let allNames = PackagesData.packageNames
         allNames |> Array.sortBy(fun _ -> rnd.Next()) |> Array.take n
 
-    let generateFunctionData (deps: FunctionGenerateOptions.Dependencies) n =
+    let generateFunctionData (deps: FunctionGenerateOptions.DependenciesCount) n =
         match deps with
         | DataUnawareRandomUniform c ->
             let nNames = getNRandomPackageNames c
@@ -181,18 +186,20 @@ module FunctionGenerator =
             })
 
 module QueueFunctionGeneration = 
+    open FunctionGenerateOptions
     type DayOfWeekName = string
     type FreqHour = int
+    type NumberOfFunctionsInSystem = int
 
-    type FunctionInvokeMode =
+    type FunctionCoopMode =
         | IgnoreCoopNetwork
         | UseCoopNetwork
 
-    type FrequencyGenerationMode = 
+    type FrequencyOfInvocationMode = 
         | IgnoreFrequencyData
         | UseFrequencyData of Map<DayOfWeekName,Map<FreqHour,int>>
 
-    type Options = FrequencyGenerationMode * FunctionInvokeMode
+    type Options = FrequencyOfInvocationMode * FunctionCoopMode * FunctionGenerateOptions.DependenciesCount
 
 
 type QueueFunctionRequest = {
@@ -206,21 +213,50 @@ module QueueDataGenerator =
     open FunctionGenerator
     open DSExtensions
     open MathNet.Numerics.Distributions
+    open QueueFunctionGeneration
     let generateFunctionDuration() = 
         let chi = Sample.chiSquared 2.1 rnd |> (*) 30.0<second> 
         let min = FunctionDuration_MinRuntimeDuration
         if chi < min then min else chi
 
-    let getNextFunctionRequestTime () =
-        let m = FunctionRunRequestEvery_NormalMean |> (*) 1.0<1/second>
-        let s = FunctionRunRequestEvery_NormalStdDev |> (*) 1.0<1/second>
-        Sample.normal m s rnd |> abs |> ceil |> int64 |> (*) 1L<second>
+    let getNextFunctionRequestTimeDiff (option: FrequencyOfInvocationMode) (currentDayOfWeek: string) (currentTime: LocalTime) =
+        match option with
+        | IgnoreFrequencyData ->
+            let m = FunctionRunRequestEvery_NormalMean |> (*) 1.0<1/second>
+            let s = FunctionRunRequestEvery_NormalStdDev |> (*) 1.0<1/second>
+            Sample.normal m s rnd |> abs |> ceil |> int64 |> (*) 1L<second>
+        | UseFrequencyData data ->
+            let normalMeanOf callFreqPerHour = 3600.0 / callFreqPerHour
+            let stdDevOf normalMean = normalMean / 3.0
+            let currentHour = currentTime.Hour
+            let currentFreq = data.[currentDayOfWeek].[currentHour]
+            let m = normalMeanOf currentFreq
+            let s = stdDevOf m
+            Sample.normal m s rnd |> abs |> ceil |> int64 |> (*) 1L<second>
 
-    let generateFunctionQueueData (options: QueueFunctionGeneration.Options) = 
+    let pickFunction (fs: ServerlessFunction list)
+
+    let generateFunctionQueueData (options: QueueFunctionGeneration.Options) (numberOfFunctions: int) = 
+        let terminationCondition (prevTime: LocalTime) (newTime: LocalTime) =
+            prevTime.Hour = 23 && newTime.Hour = 0
+
+        let (freqMode, coopMode, depencencyMode) = options
+
+        let funcList = generateFunctionData depencencyMode numberOfFunctions
+        let funcsMap =
+            funcList
+            |> List.map (fun x -> (x.name, x))
+            |> Map.ofList
+
         let rec generate (currentTime: LocalTime) (result: QueueFunctionRequest list) =
-            let secsToAdd = getNextFunctionRequestTime() * (1L<1/second>)
-            let startTime = LocalTime(0,0,0).PlusSeconds(secsToAdd)
-            0
+            let secsToAdd = getNextFunctionRequestTimeDiff freqMode "saturday" currentTime * (1L<1/second>)
+            let startTime = currentTime.PlusSeconds(secsToAdd)
 
+            let nextFunctionToPick = 
+                match coopMode with
+                | IgnoreCoopNetwork -> funcs |> L
+            
+
+            
         generate (LocalTime(0,0,0)) []
         
