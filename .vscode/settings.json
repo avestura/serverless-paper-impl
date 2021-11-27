@@ -1,4 +1,5 @@
 {
     "jupyter.jupyterServerType": "local",
-    "editor.formatOnSave": false
+    "editor.formatOnSave": false,
+    "deno.enable": true
 }

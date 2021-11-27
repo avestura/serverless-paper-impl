@@ -1,0 +1,14 @@
+{
+    "name": "express",
+    "version": "4.17.1",
+    "publish": {
+      "bytes": 209321,
+      "pretty": "204 kB",
+      "color": "#97CA00"
+    },
+    "install": {
+      "bytes": 1690781,
+      "pretty": "1.61 MB",
+      "color": "#007EC6"
+    }
+  }

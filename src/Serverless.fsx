@@ -1,5 +1,10 @@
 namespace Avestura.Serverless
 
+open NodaTime
+open System.Text.Json
+open System.Text.Json.Serialization
+open System.Collections.Generic
+
 #r "nuget: FSharp.Data"
 #r "nuget: NodaTime"
 #r "nuget: MathNet.Numerics"
@@ -10,6 +15,8 @@ open System.IO
 open System.Text.Json
 open FSharp.Data
 open Microsoft.FSharp.Data.UnitSystems.SI.UnitNames
+open System.Text.Json
+open System.Text.Json.Serialization
 
 module General =
     let rnd = Random()
@@ -19,14 +26,20 @@ module General =
 
     let FunctionDuration_MaxRuntimeDuration = 300<second>
     let FunctionDuration_DefaultChiSquareFreedom = 2.1
-    let FunctionDuration_MinRuntimeDuration = 2.0<second>
+    let FunctionDuration_MinRuntimeDuration = 1.0<second>
 
     let FunctionRunRequestEvery_NormalMean = 30.0<second>
     let FunctionRunRequestEvery_NormalStdDev = 10.0<second>
 
+module NodaTimeUtils =
+    let addDuration (d: Duration) (lt: LocalTime) =
+        lt.PlusTicks(d.TotalTicks |> int64)
 
 module DSExtensions =
     open General
+
+    let pickRandomItemFromList (list: 'a list) =
+        list.[rnd.Next(0, list.Length)]
 
     let makeProbMap (m: Map<string, int>) =
         let sum = m.Values |> Seq.sum |> float
@@ -79,6 +92,30 @@ module PaperDataUtils =
     let convertKey (converter: string -> 'a) (props: (string * JsonValue) array) =
         props |> Array.map(fun (key, value) -> (converter key, value))
 
+type PackageSizeInfo = {
+    name: string
+    install: {|
+        bytes: int
+        pretty: string
+    |}
+    publish: {|
+        bytes: int
+        pretty: string
+    |}
+}
+
+type PackageFullInfo = {
+    name: string
+    dependencyCount: int
+    install: {|
+        bytes: int
+        pretty: string
+    |}
+    publish: {|
+        bytes: int
+        pretty: string
+    |}
+}
 
 module PackagesData = 
     open DSExtensions
@@ -86,13 +123,19 @@ module PackagesData =
     type DependentUponDataType = JsonProvider<"../data/packageData/dependentUpon.json">
     type HitsRankDataType = JsonProvider<"../data/packageData/hitsrank.json">
     type PageRankDataType = JsonProvider<"../data/packageData/pagerank.json">
+    type PackagePhobiaResponse = JsonProvider<"../data/schemas/packagephobia_repsonse.json">
+    type DependentUponSizeData = JsonProvider<"../data/packageData/size_partial_data/dependentUpon_sizes_part1.json">
 
     let packageNames =
         DependentUponDataType.GetSample().JsonValue.Properties() |> Array.map(fun (x, y) -> x)
 
     let dependentUpon = 
-        DependentUponDataType.GetSample().JsonValue.Properties() |> convertJsonValue (fun x -> x.AsInteger())
-        
+        DependentUponDataType.GetSample().JsonValue.Properties()  |> convertJsonValue (fun x -> x.AsInteger())
+       
+    let fullPackageData =
+        let json = File.ReadAllText("../data/packageData/dependentUpon_full.json")
+        JsonSerializer.Deserialize<Dictionary<string, PackageFullInfo>>(json)
+
     let probOfDependency packageName =
         let sum = dependentUpon.Values |> Seq.sum |> float
         (float dependentUpon.[packageName]) / sum
@@ -104,7 +147,36 @@ module PackagesData =
 
     let pagerank =
         PageRankDataType.GetSample().JsonValue.Properties() |> convertJsonValue (fun x -> x.AsFloat())
+
+    let getPackageSizeData packageName =
+        let result = PackagePhobiaResponse.Load($"https://packagephobia.com/v2/api.json?p=%s{packageName}")
+
+        {
+            name = result.Name
+            install = {|
+                bytes = result.Install.Bytes
+                pretty = result.Install.Pretty
+            |}
+            publish = {|
+                bytes = result.Publish.Bytes
+                pretty = result.Publish.Pretty
+            |}
+        }
     
+    let downloadAndSaveAllPackageSizes (items: string list) =
+        let rec download (remainingItems: string list) (result: Map<string, PackageSizeInfo>) =
+            match remainingItems with
+            | [] -> 
+                File.WriteAllText("../data/packageData/dependentUpon_sizes.json", JsonSerializer.Serialize(result))
+                printfn "Save completed."
+                result
+            | pkgName::otherPkgs ->
+                printfn $"Download data for package {pkgName}"
+                let sizeData = getPackageSizeData pkgName
+                File.WriteAllText("../data/packageData/dependentUpon_sizes.json", JsonSerializer.Serialize(result))
+                download otherPkgs (result |> Map.add pkgName sizeData)
+
+        download items ([] |> Map.ofList)
 
 module FrequenciesData =
     open PaperDataUtils
@@ -188,8 +260,7 @@ module FunctionGenerator =
 module QueueFunctionGeneration = 
     open FunctionGenerateOptions
     type DayOfWeekName = string
-    type FreqHour = int
-    type NumberOfFunctionsInSystem = int
+    type FreqHour = int    
 
     type FunctionCoopMode =
         | IgnoreCoopNetwork
@@ -234,8 +305,6 @@ module QueueDataGenerator =
             let s = stdDevOf m
             Sample.normal m s rnd |> abs |> ceil |> int64 |> (*) 1L<second>
 
-    let pickFunction (fs: ServerlessFunction list)
-
     let generateFunctionQueueData (options: QueueFunctionGeneration.Options) (numberOfFunctions: int) = 
         let terminationCondition (prevTime: LocalTime) (newTime: LocalTime) =
             prevTime.Hour = 23 && newTime.Hour = 0
@@ -243,20 +312,25 @@ module QueueDataGenerator =
         let (freqMode, coopMode, depencencyMode) = options
 
         let funcList = generateFunctionData depencencyMode numberOfFunctions
-        let funcsMap =
-            funcList
-            |> List.map (fun x -> (x.name, x))
-            |> Map.ofList
 
         let rec generate (currentTime: LocalTime) (result: QueueFunctionRequest list) =
             let secsToAdd = getNextFunctionRequestTimeDiff freqMode "saturday" currentTime * (1L<1/second>)
             let startTime = currentTime.PlusSeconds(secsToAdd)
+            let serviceTime = generateFunctionDuration() |> (*) 1.0<1/second>
+            if terminationCondition currentTime startTime then result
+            else
+                let nextFunctionToPick = 
+                    match coopMode with
+                    | IgnoreCoopNetwork -> pickRandomItemFromList funcList
+                    | UseCoopNetwork -> pickRandomItemFromList funcList // TODO: must be fixed
 
-            let nextFunctionToPick = 
-                match coopMode with
-                | IgnoreCoopNetwork -> funcs |> L
-            
+                let newItem = {
+                    func = nextFunctionToPick
+                    startTime = startTime
+                    serviceTime = Duration.FromSeconds serviceTime
+                }
 
+                generate startTime (result@[newItem])
             
         generate (LocalTime(0,0,0)) []
         

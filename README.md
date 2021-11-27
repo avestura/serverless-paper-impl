@@ -15,9 +15,9 @@ My masters paper impl
   - [x] Package-Frequency aware generator
     - [x] Uniform Dist
     - [x] Normal Dist
-- [ ] Implement the Synthetic Data Generator
-  - [ ] Random Invocation time generator
-  - [ ] Invocation Frequency aware generator
+- [x] Implement the Synthetic Data Generator
+  - [x] Random Invocation time generator
+  - [x] Invocation Frequency aware generator
 - [ ] Write the event simulator based on synthetic generator
 - [ ] Massure approaches by
   - [ ] Response time
