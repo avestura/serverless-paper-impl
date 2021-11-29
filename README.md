@@ -5,9 +5,11 @@ My masters paper impl
 ## Tasks
 ### General
 
-- [ ] Implement "restore time" calculator based on function deps
+- [x] Implement Weilbull Stretched function
+- [x] Implement Normalizer function 
+- [x] Implement "restore time" calculator based on function deps
 - [x] Implement Russuan Roullete
-- [ ] Implement Similarity Function
+- [x] Implement Similarity Function
 - [x] Create function data generator
   - [x] Fully-random generator
     - [x] Uniform Dist
@@ -19,11 +21,29 @@ My masters paper impl
   - [x] Random Invocation time generator
   - [x] Invocation Frequency aware generator
 - [ ] Write the event simulator based on synthetic generator
-- [ ] Massure approaches by
-  - [ ] Response time
-  - [ ] Cost
-  - [ ] Throughput
-  - [ ] Response/Cost Ratio
+- [ ] Implement schedulers
+  - [ ] No-merge
+  - [ ] Random Wait
+  - [ ] Static Wait
+  - [ ] Dynamic Wait
+- [ ] Evaluate scheduler metrics
+  - [ ] Using Fully Random Synthetic Data
+    - [ ] No-merge
+    - [ ] Random Wait
+    - [ ] Static Wait
+    - [ ] Dynamic Wait
+  - [ ] Using Realistic Synthetic Data
+    - [ ] No-merge
+    - [ ] Random Wait
+    - [ ] Static Wait
+    - [ ] Dynamic Wait
+
+
+- Massure approaches by
+  - Response time
+  - Cost
+  - Throughput
+  - Response/Cost Ratio
 
 #### No-Merge approach
 

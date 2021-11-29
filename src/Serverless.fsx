@@ -18,7 +18,12 @@ open Microsoft.FSharp.Data.UnitSystems.SI.UnitNames
 open System.Text.Json
 open System.Text.Json.Serialization
 
+[<Measure>] type dbyte
+[<Measure>] type kilobyte
+[<Measure>] type megabyte
+
 module General =
+    open MathNet.Numerics.Distributions
     let rnd = Random()
 
     let NumberOfFunctionDeps_DefaultNormalDistMean = 50
@@ -30,7 +35,27 @@ module General =
 
     let FunctionRunRequestEvery_NormalMean = 30.0<second>
     let FunctionRunRequestEvery_NormalStdDev = 10.0<second>
+    
+    let FunctionSimilarity_TopNCommonDependencies = 10
 
+    let PackageRestoreSpeed = 2.<second/megabyte>
+
+
+    let inline weilbullStretched x a b = 1. - (Math.E ** (-1. * ((x/a) ** b)))
+    let inline normalize x = min 1. (weilbullStretched x 5. 2.)
+
+    let bytesToKilobytes (x: float<dbyte>) = x / (1000.0<dbyte/kilobyte>)
+    let kilobytesToMegabytes (x: float<kilobyte>) = x / (1000.0<kilobyte/megabyte>)
+    let bytesToMegabytes = bytesToKilobytes >> kilobytesToMegabytes
+
+    let calculateRestorationTime (size: float<dbyte>) =
+        let mb = bytesToMegabytes size
+        let sec = PackageRestoreSpeed * mb
+
+        let strippedSec = sec * 1.0<1/second>
+
+        Sample.normal strippedSec (strippedSec / 5.) rnd |> abs |> ceil |> int64 |> (*) 1L<second>
+ 
 module NodaTimeUtils =
     let addDuration (d: Duration) (lt: LocalTime) =
         lt.PlusTicks(d.TotalTicks |> int64)
@@ -136,6 +161,47 @@ module PackagesData =
         let json = File.ReadAllText("../data/packageData/dependentUpon_full.json")
         JsonSerializer.Deserialize<Dictionary<string, PackageFullInfo>>(json)
 
+    let getFullPackageDataSafe packageName =
+        let holes = [
+            "xml2js"
+            "cookie-parser"
+            "fsevents"
+            "highlight.js"
+            "puppeteer"
+            "serialport"
+            "pump"
+            "url-parse"
+            "requirejs"
+            "text-table"
+            "fs-promise"
+            "yargs-parser"
+            "phantomjs-prebuilt"
+            "phantomjs"
+            "hiredis"
+            "serialize-javascript"
+            "imagemin-pngquant"
+            "xml2json"
+            "yeoman-environment"
+            "karma-mocha"
+            "karma-phantomjs-launcher"
+        ]
+
+        if holes |> List.contains packageName then
+            {
+                name = packageName
+                dependencyCount = fullPackageData.[packageName].dependencyCount
+                install = {|
+                    bytes = 3841636 // Average of other packages with install data
+                    pretty = "<mean>"
+                |}
+                publish = {|
+                    bytes = 1696329 // Average of other packages with publish data
+                    pretty = "<mean>"
+                |}
+            }
+        else
+            fullPackageData.[packageName]
+
     let probOfDependency packageName =
         let sum = dependentUpon.Values |> Seq.sum |> float
         (float dependentUpon.[packageName]) / sum
@@ -148,7 +214,7 @@ module PackagesData =
     let pagerank =
         PageRankDataType.GetSample().JsonValue.Properties() |> convertJsonValue (fun x -> x.AsFloat())
 
-    let getPackageSizeData packageName =
+    let fetchPackageSizeData packageName =
         let result = PackagePhobiaResponse.Load($"https://packagephobia.com/v2/api.json?p=%s{packageName}")
 
         {
@@ -172,11 +238,11 @@ module PackagesData =
                 result
             | pkgName::otherPkgs ->
                 printfn $"Download data for package {pkgName}"
-                let sizeData = getPackageSizeData pkgName
+                let sizeData = fetchPackageSizeData pkgName
                 File.WriteAllText("../data/packageData/dependentUpon_sizes.json", JsonSerializer.Serialize(result))
                 download otherPkgs (result |> Map.add pkgName sizeData)
 
-        download items ([] |> Map.ofList)
+        download items (Map.ofList [])
 
 module FrequenciesData =
     open PaperDataUtils
@@ -192,6 +258,29 @@ type ServerlessFunction = {
     name: string
     deps: string list
 }
+
+module ServerlessFunctionUtils = 
+    open PackagesData
+    open System.Linq
+    open General
+    let similarity (f1: ServerlessFunction) (f2: ServerlessFunction) =
+        if f1.name = f2.name then 1.
+        else
+            let orderedDeps (f: ServerlessFunction) =
+                f.deps
+                |> List.map getFullPackageDataSafe
+                |> List.sortBy (fun x -> x.install.bytes)
+
+            let od1 = orderedDeps f1
+            let od2 = orderedDeps f2
+            let intersect =
+                (Seq.ofList od1).Intersect(od2)
+                |> Seq.take FunctionSimilarity_TopNCommonDependencies
+                |> Seq.sumBy (fun x -> x.install.bytes)
+
+            normalize intersect
+
+
 
 type EnvironmentContext = {
     currentDayOfWeek: string
