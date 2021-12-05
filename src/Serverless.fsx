@@ -110,6 +110,10 @@ module DSExtensions =
 
         takeNFromRussianRouletteMapRec cleansedMap n []
 
+    let rec insertSorted item = function
+    | x::xs -> min x item::(insertSorted (max x item) xs)
+    | _ -> [item]
+
 module PaperDataUtils = 
     let convertJsonValue (converter: JsonValue -> 'a) (props: ('b * JsonValue) array) =
         props |> Array.map(fun (key, value) -> (key, converter value)) |> Map.ofArray
@@ -423,3 +427,47 @@ module QueueDataGenerator =
             
         generate (LocalTime(0,0,0)) []
         
+
+type TimelineEventKind =
+    | QueueRequest of QueueFunctionRequest
+    | NOP
+
+
+[<CustomComparison;CustomEquality>]
+type TimelineEvent = {
+    time: LocalTime
+    event: TimelineEventKind
+} with
+    override x.Equals(yobj) = 
+        match yobj with
+        | :? TimelineEvent as y -> (x.time = y.time)
+        | _ -> false
+
+    override x.GetHashCode() = hash (x.time)
+    interface System.IComparable with
+        member x.CompareTo yobj =
+            match yobj with
+            | :? TimelineEvent as y -> compare (x.time) (y.time)
+            | _ -> invalidArg "yobj" "cannot compare value of different types"
+
+type Container = {
+    name: string
+    runningFunction: ServerlessFunction
+    created: LocalTime
+    disposed: LocalTime option
+    idleDuration: Duration
+}
+    with
+        member this.IsDisposed() = this.disposed.IsSome
+
+type SimulatorContext = {
+    day: string
+    events: TimelineEvent list
+    containerCounter: int
+    containers: Container
+}
+
+module Simulator =
+    open DSExtensions
+    let insertEvent (item: TimelineEvent) (evList: TimelineEvent list) =
+        insertSorted item evList
