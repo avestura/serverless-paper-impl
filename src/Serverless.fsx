@@ -479,6 +479,7 @@ type Container = {
     totalRestorationDuration: Duration
     chanceofWatiningMore: float 
     previousFunctions: ServerlessFunction list
+    mountKey: Guid // A key to keep track of changes in the container status of being occupied by different functions
 }
     with
         member this.isDisposed() = this.disposed.IsSome
@@ -496,6 +497,7 @@ type Container = {
                 totalRestorationDuration = Duration.Zero
                 chanceofWatiningMore = 0.0
                 previousFunctions = []
+                mountKey = Guid.NewGuid()
             }
         member this.terminate disposeTime =
             {
@@ -504,14 +506,15 @@ type Container = {
                     finishedExecTime = Some disposeTime
                     runningFunction = None
                     previousFunctions = match this.runningFunction with Some x -> this.previousFunctions@[x] | _ -> this.previousFunctions
+                    mountKey = Guid.NewGuid()
             }
         member this.finishExec finishTime =
-            { this with finishedExecTime = Some finishTime }
+            { this with finishedExecTime = Some finishTime; mountKey = Guid.NewGuid() }
 
 type TimelineEventKind =
     | QueueRequest of QueueFunctionRequest // A new function wants to run in the serverless platform
     | FinishRunningFunction of Container // A function finished its execution in container
-    | MountWaitTimedOut of Container // Container waited some time epoch for another function to join but nothing happened
+    | MountWaitTimedOut of Container * mountKey: Guid // Container waited some time epoch for another function to join but nothing happened
 
 [<CustomComparison;CustomEquality>]
 type TimelineEvent = {
@@ -591,6 +594,7 @@ module Schedulers =
                 totalWorkingDuration = qfr.serviceTime
                 chanceofWatiningMore = 0.0
                 previousFunctions = []
+                mountKey = Guid.NewGuid()
             }
             { ctx with
                 containerIdCounter = ctx.containerIdCounter + 1
@@ -626,6 +630,7 @@ module Schedulers =
                     totalWorkingDuration = qfr.serviceTime
                     chanceofWatiningMore = 0.0
                     previousFunctions = []
+                    mountKey = Guid.NewGuid()
                 }
                 { ctx with
                     containerIdCounter = ctx.containerIdCounter + 1
@@ -648,6 +653,7 @@ module Schedulers =
                         totalWaitForNextFunctionDuration = host.totalWaitForNextFunctionDuration + waitTime
                         totalWorkingDuration = host.totalWorkingDuration + qfr.serviceTime
                         previousFunctions = host.previousFunctions @ [host.runningFunction.Value]
+                        mountKey = Guid.NewGuid()
                 }
                 {
                     ctx with
@@ -660,17 +666,31 @@ module Schedulers =
 
 
         | FinishRunningFunction cont ->
+            let nextEventTime = time.PlusSeconds(getWaitTime() |> int64)
+            let newKey = Guid.NewGuid()
             let newCont = {
                 cont with
                     finishedExecTime = Some time
+                    mountKey = newKey
             }
             { ctx with
-                containers = ctx.containers |> Map.add newCont.name newCont      
+                containers = ctx.containers |> Map.add newCont.name newCont
+                events = ctx.events |> insertEvent {
+                    time = nextEventTime
+                    kind = MountWaitTimedOut (newCont, newKey)
+                }
             }
-        | MountWaitTimedOut cont ->
-            ctx
+        | MountWaitTimedOut (cont, key) ->
+            let targetCont = ctx.containers.[cont.name]
+            if key = targetCont.mountKey then
+                ctx
+            else
+                ctx
 
-    let staticWaitScheduler (waitTime: int<second>): Scheduler = computedWaitScheduler (fun () -> waitTime)
+    let staticWaitScheduler (waitTime: int<second>): Scheduler =
+        computedWaitScheduler (fun () -> waitTime)
+
     let randomWaitScheduler (mean: int<second>) (stddev: int<second>): Scheduler =
-        computedWaitScheduler (fun () -> Normal.Sample (float mean, float stddev) |> ceil |> int |> (*) 1<second> )
+        computedWaitScheduler (fun () -> Normal.Sample (float mean, float stddev) |> ceil |> int |> (*) 1<second>)
+
     let dynamicWaitScheduler = 0

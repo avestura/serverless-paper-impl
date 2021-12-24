@@ -20,11 +20,11 @@ My masters paper impl
 - [x] Implement the Synthetic Data Generator
   - [x] Random Invocation time generator
   - [x] Invocation Frequency aware generator
-- [ ] Write the event simulator based on synthetic generator
+- [x] Write the event simulator based on synthetic generator
 - [ ] Implement schedulers
-  - [ ] No-merge
-  - [ ] Random Wait
-  - [ ] Static Wait
+  - [x] No-merge
+  - [x] Random Wait
+  - [x] Static Wait
   - [ ] Dynamic Wait
 - [ ] Evaluate scheduler metrics
   - [ ] Using Fully Random Synthetic Data
