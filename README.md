@@ -70,3 +70,4 @@ Wait for 5 mins after function terminates
 - Number of Function dependencies: Normal, u = 50, stddev = 15
 - Function Duration: Chi-Square, v = 2.1
 - Function Run Request Every: Normal, u = 30, stddev = 10
+- Random Wait Scheduler Wait Time: Normal, u = 240, stddev = 50

@@ -4,6 +4,7 @@ open NodaTime
 open System.Text.Json
 open System.Text.Json.Serialization
 open System.Collections.Generic
+open MathNet.Numerics.Distributions
 
 #r "nuget: FSharp.Data"
 #r "nuget: NodaTime"
@@ -52,9 +53,12 @@ module General =
         let mb = bytesToMegabytes size
         let sec = PackageRestoreSpeed * mb
 
-        let strippedSec = sec * 1.0<1/second>
+        let strippedSec = float sec 
 
         Sample.normal strippedSec (strippedSec / 5.) rnd |> abs |> ceil |> int64 |> (*) 1L<second>
+
+    let calculateRestorationDuration (size: float<dbyte>) =
+        size |> calculateRestorationTime |> int64 |> Duration.FromSeconds
  
 module NodaTimeUtils =
     let addDuration (d: Duration) (lt: LocalTime) =
@@ -114,6 +118,10 @@ module DSExtensions =
     | x::xs -> min x item::(insertSorted (max x item) xs)
     | _ -> [item]
 
+    let listSubtract (a: 'a list) (b: 'a list) =
+        let unique = set b
+        a |> List.filter (fun x -> unique.Contains x = false)
+
 module PaperDataUtils = 
     let convertJsonValue (converter: JsonValue -> 'a) (props: ('b * JsonValue) array) =
         props |> Array.map(fun (key, value) -> (key, converter value)) |> Map.ofArray
@@ -161,7 +169,7 @@ module PackagesData =
     let dependentUpon = 
         DependentUponDataType.GetSample().JsonValue.Properties()  |> convertJsonValue (fun x -> x.AsInteger())
        
-    let fullPackageData =
+    let fullAllPackagesData =
         let json = File.ReadAllText("../data/packageData/dependentUpon_full.json")
         JsonSerializer.Deserialize<Dictionary<string, PackageFullInfo>>(json)
 
@@ -193,7 +201,7 @@ module PackagesData =
         if holes |> List.contains packageName then
             {
                 name = packageName
-                dependencyCount = fullPackageData.[packageName].dependencyCount
+                dependencyCount = fullAllPackagesData.[packageName].dependencyCount
                 install = {|
                     bytes = 3841636 // Average of other packages with install data
                     pretty = "<mean>"
@@ -204,8 +212,14 @@ module PackagesData =
                 |}
             }
         else
-            fullPackageData.[packageName]
+            fullAllPackagesData.[packageName]
 
+    let fullAllPackagesDataSafe = 
+        fullAllPackagesData.Keys
+            |> List.ofSeq
+            |> List.map (fun x -> x, getFullPackageDataSafe x)
+            |> Map.ofList
+        
     let probOfDependency packageName =
         let sum = dependentUpon.Values |> Seq.sum |> float
         (float dependentUpon.[packageName]) / sum
@@ -262,6 +276,30 @@ type ServerlessFunction = {
     name: string
     deps: string list
 }
+with
+    member this.getFullDependencySize() =
+        this.deps
+        |> List.map PackagesData.getFullPackageDataSafe 
+        |> List.map (fun x -> x.install.bytes)
+        |> List.sum
+        |> (*) 1<dbyte>
+    member this.getNonCachedDependencySize (cachedFunc: ServerlessFunction) =
+        let notCachedDeps = DSExtensions.listSubtract this.deps cachedFunc.deps
+        notCachedDeps
+        |> List.map PackagesData.getFullPackageDataSafe 
+        |> List.map (fun x -> x.install.bytes)
+        |> List.sum
+        |> (*) 1<dbyte>
+    member this.fullRestorationDuration() = 
+        this.getFullDependencySize()
+        |> float
+        |> (*) 1.0<dbyte>
+        |> General.calculateRestorationDuration
+    member this.nonCachedRestorationDuration (cachedFunc: ServerlessFunction) =
+        this.getNonCachedDependencySize cachedFunc
+        |> float
+        |> (*) 1.0<dbyte>
+        |> General.calculateRestorationDuration
 
 module ServerlessFunctionUtils = 
     open PackagesData
@@ -351,6 +389,7 @@ module FunctionGenerator =
             })
 
 module QueueFunctionGeneration = 
+    open General
     open FunctionGenerateOptions
     type DayOfWeekName = string
     type FreqHour = int    
@@ -363,6 +402,8 @@ module QueueFunctionGeneration =
         | IgnoreFrequencyData
         | UseFrequencyData of Map<DayOfWeekName,Map<FreqHour,int>>
 
+    let defaultUnawareRandomNormalDepsCount = DataUnawareRandomNormal (NumberOfFunctionDeps_DefaultNormalDistMean, NumberOfFunctionDeps_DefaultNormalDistStdDev)
+    let defaultAwareRandomNormalDepsCount = DataAwareRandomNormal (None, NumberOfFunctionDeps_DefaultNormalDistMean, NumberOfFunctionDeps_DefaultNormalDistStdDev)
     type Options = FrequencyOfInvocationMode * FunctionCoopMode * FunctionGenerateOptions.DependenciesCount
 
 
@@ -427,16 +468,55 @@ module QueueDataGenerator =
             
         generate (LocalTime(0,0,0)) []
         
+type Container = {
+    name: string
+    runningFunction: ServerlessFunction option
+    created: LocalTime
+    finishedExecTime: LocalTime option
+    disposed: LocalTime option
+    totalWorkingDuration: Duration
+    totalWaitForNextFunctionDuration: Duration
+    totalRestorationDuration: Duration
+    chanceofWatiningMore: float 
+    previousFunctions: ServerlessFunction list
+}
+    with
+        member this.isDisposed() = this.disposed.IsSome
+        member this.numberOfTimesUsed() = this.previousFunctions |> List.length
+        member this.isWaitingForNextFunction() = this.finishedExecTime.IsSome && (this.isDisposed() |> not)
+        static member makeNew name func created =
+            {
+                name = name
+                runningFunction = func
+                created = created
+                finishedExecTime = None
+                disposed = None
+                totalWorkingDuration = Duration.Zero
+                totalWaitForNextFunctionDuration = Duration.Zero
+                totalRestorationDuration = Duration.Zero
+                chanceofWatiningMore = 0.0
+                previousFunctions = []
+            }
+        member this.terminate disposeTime =
+            {
+                this with 
+                    disposed = Some disposeTime
+                    finishedExecTime = Some disposeTime
+                    runningFunction = None
+                    previousFunctions = match this.runningFunction with Some x -> this.previousFunctions@[x] | _ -> this.previousFunctions
+            }
+        member this.finishExec finishTime =
+            { this with finishedExecTime = Some finishTime }
 
 type TimelineEventKind =
-    | QueueRequest of QueueFunctionRequest
-    | NOP
-
+    | QueueRequest of QueueFunctionRequest // A new function wants to run in the serverless platform
+    | FinishRunningFunction of Container // A function finished its execution in container
+    | MountWaitTimedOut of Container // Container waited some time epoch for another function to join but nothing happened
 
 [<CustomComparison;CustomEquality>]
 type TimelineEvent = {
     time: LocalTime
-    event: TimelineEventKind
+    kind: TimelineEventKind
 } with
     override x.Equals(yobj) = 
         match yobj with
@@ -450,24 +530,147 @@ type TimelineEvent = {
             | :? TimelineEvent as y -> compare (x.time) (y.time)
             | _ -> invalidArg "yobj" "cannot compare value of different types"
 
-type Container = {
-    name: string
-    runningFunction: ServerlessFunction
-    created: LocalTime
-    disposed: LocalTime option
-    idleDuration: Duration
-}
-    with
-        member this.IsDisposed() = this.disposed.IsSome
 
 type SimulatorContext = {
     day: string
     events: TimelineEvent list
-    containerCounter: int
-    containers: Container
+    containerIdCounter: int
+    containers: Map<string, Container>
 }
+with
+    member this.getMountableContainers() =
+        this.containers.Values
+        |> List.ofSeq
+        |> List.filter (fun x -> x.isWaitingForNextFunction())
+
+type Scheduler = TimelineEvent -> SimulatorContext -> SimulatorContext
 
 module Simulator =
     open DSExtensions
     let insertEvent (item: TimelineEvent) (evList: TimelineEvent list) =
         insertSorted item evList
+
+    let rec runSimulation (scheduler: Scheduler) (context: SimulatorContext) =
+        match context.events with
+        | [] -> context
+        | event::restEvents -> 
+            let popEventContext = { context with events = restEvents }
+            let newContext = scheduler event popEventContext
+            runSimulation scheduler newContext
+
+    let convertQueueRequestDataToSimulatorContext (day: string) (queueFuncReq: QueueFunctionRequest list) =
+        {
+            day = day
+            events = queueFuncReq |> List.map (fun qfr -> { time = qfr.startTime ; kind = QueueRequest qfr })
+            containerIdCounter = 0
+            containers = Map.empty
+        }
+
+    let runSimulatonWithQueueData (day: string) (queueFuncData: QueueFunctionRequest list) (scheduler: Scheduler) =
+        let ctx = convertQueueRequestDataToSimulatorContext day queueFuncData
+        runSimulation scheduler ctx
+
+module Schedulers =
+    open General
+    open Simulator
+    let doNothingScheduler : Scheduler = fun _ ctx -> ctx
+    let noMergeScheduler: Scheduler = fun ev ctx ->
+        let (time, kind) = ev.time, ev.kind
+        match kind with
+        | QueueRequest qfr ->
+            let restoreDuration = qfr.func.fullRestorationDuration()
+            let functionFinish = time.PlusNanoseconds((restoreDuration + qfr.serviceTime).ToInt64Nanoseconds())
+            let newContainer = {
+                name = $"container-%d{ctx.containerIdCounter}"
+                runningFunction = Some qfr.func
+                created = time
+                finishedExecTime = None
+                disposed = None
+                totalRestorationDuration = restoreDuration
+                totalWaitForNextFunctionDuration = Duration.Zero
+                totalWorkingDuration = qfr.serviceTime
+                chanceofWatiningMore = 0.0
+                previousFunctions = []
+            }
+            { ctx with
+                containerIdCounter = ctx.containerIdCounter + 1
+                containers = ctx.containers |> Map.add newContainer.name newContainer
+                events = ctx.events |> insertEvent {
+                    time = functionFinish
+                    kind = FinishRunningFunction newContainer
+                }
+            }
+        | FinishRunningFunction container -> 
+            let terminatedContainer = container.terminate ev.time
+            let newConts = ctx.containers |> Map.add container.name terminatedContainer
+            { ctx with containers = newConts }
+        | _ -> ctx
+
+    let computedWaitScheduler (getWaitTime: unit -> int<second>): Scheduler = fun ev ctx ->
+        let (time, kind) = ev.time, ev.kind
+        match kind with
+        | QueueRequest qfr ->
+            let mountConts = ctx.getMountableContainers()
+            match mountConts with
+            | [] ->
+                let restoreDuration = qfr.func.fullRestorationDuration()
+                let functionFinish = time.PlusNanoseconds((restoreDuration + qfr.serviceTime).ToInt64Nanoseconds())
+                let newContainer = {
+                    name = $"container-%d{ctx.containerIdCounter}"
+                    runningFunction = Some qfr.func
+                    created = time
+                    finishedExecTime = None
+                    disposed = None
+                    totalRestorationDuration = restoreDuration
+                    totalWaitForNextFunctionDuration = Duration.Zero
+                    totalWorkingDuration = qfr.serviceTime
+                    chanceofWatiningMore = 0.0
+                    previousFunctions = []
+                }
+                { ctx with
+                    containerIdCounter = ctx.containerIdCounter + 1
+                    containers = ctx.containers |> Map.add newContainer.name newContainer
+                    events = ctx.events |> insertEvent {
+                        time = functionFinish
+                        kind = FinishRunningFunction newContainer
+                    }
+                }
+            | conts ->
+                let host = DSExtensions.pickRandomItemFromList conts
+                let restorationTime = qfr.func.nonCachedRestorationDuration host.runningFunction.Value
+                let waitTime = (time - host.finishedExecTime.Value).ToDuration()
+                let finishTime = time.PlusNanoseconds((restorationTime + qfr.serviceTime).ToInt64Nanoseconds())
+                let modifiedHost = {
+                    host with
+                        runningFunction = Some qfr.func
+                        finishedExecTime = None
+                        totalRestorationDuration = host.totalRestorationDuration + restorationTime
+                        totalWaitForNextFunctionDuration = host.totalWaitForNextFunctionDuration + waitTime
+                        totalWorkingDuration = host.totalWorkingDuration + qfr.serviceTime
+                        previousFunctions = host.previousFunctions @ [host.runningFunction.Value]
+                }
+                {
+                    ctx with
+                        containers = ctx.containers |> Map.add modifiedHost.name modifiedHost
+                        events = ctx.events |> insertEvent {
+                            time = finishTime
+                            kind = FinishRunningFunction modifiedHost
+                        }
+                }
+
+
+        | FinishRunningFunction cont ->
+            let newCont = {
+                cont with
+                    finishedExecTime = Some time
+            }
+            { ctx with
+                containers = ctx.containers |> Map.add newCont.name newCont      
+            }
+        | MountWaitTimedOut cont ->
+            ctx
+
+    let staticWaitScheduler (waitTime: int<second>): Scheduler = computedWaitScheduler (fun () -> waitTime)
+    let randomWaitScheduler (mean: int<second>) (stddev: int<second>): Scheduler =
+        computedWaitScheduler (fun () -> Normal.Sample (float mean, float stddev) |> ceil |> int |> (*) 1<second> )
+    let dynamicWaitScheduler = 0
