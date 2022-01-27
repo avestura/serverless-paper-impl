@@ -26,6 +26,8 @@ My masters paper impl
   - [x] Random Wait
   - [x] Static Wait
   - [ ] Dynamic Wait
+    - [x] Implement Co-op Network
+    - [x] Implement Digestra
 - [ ] Evaluate scheduler metrics
   - [ ] Using Fully Random Synthetic Data
     - [ ] No-merge
@@ -59,9 +61,22 @@ Wait for 5 mins after function terminates
 
 ### Dynamic-Wait Approach (this paper)
 
-- [ ] Create coop network
-  - [ ] Weight Evaporation
-  - [ ] Co-op probability calculator
+- [x] Create coop network
+  - [x] Weight Evaporation
+  - [x] Co-op probability calculator
+
+WarmContainer::Number of previous function runs to consider = 1
+Container::Number of reusing the container = k = 5
+Contaner::rMax = 20 min // can't wait more than 20 min
+
+#### Policy
+
+Waiting container should consider these data:
+
+1. Similarity of its function to functions inside the running containers
+2. Previous merge fail or success status for its function
+3. co-op score 
+4. budget 
 
 
 ## Statistical Distributions

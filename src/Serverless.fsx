@@ -5,11 +5,13 @@ open System.Text.Json
 open System.Text.Json.Serialization
 open System.Collections.Generic
 open MathNet.Numerics.Distributions
+open System.Security.Cryptography
 
 #r "nuget: FSharp.Data"
 #r "nuget: NodaTime"
 #r "nuget: MathNet.Numerics"
 #r "nuget: MathNet.Numerics.FSharp"
+#r "nuget: Dijkstra.NET"
 
 open System
 open System.IO
@@ -45,8 +47,8 @@ module General =
     let inline weilbullStretched x a b = 1. - (Math.E ** (-1. * ((x/a) ** b)))
     let inline normalize x = min 1. (weilbullStretched x 5. 2.)
 
-    let bytesToKilobytes (x: float<dbyte>) = x / (1000.0<dbyte/kilobyte>)
-    let kilobytesToMegabytes (x: float<kilobyte>) = x / (1000.0<kilobyte/megabyte>)
+    let inline bytesToKilobytes (x: float<dbyte>) = x / (1000.0<dbyte/kilobyte>)
+    let inline kilobytesToMegabytes (x: float<kilobyte>) = x / (1000.0<kilobyte/megabyte>)
     let bytesToMegabytes = bytesToKilobytes >> kilobytesToMegabytes
 
     let calculateRestorationTime (size: float<dbyte>) =
@@ -121,6 +123,34 @@ module DSExtensions =
     let listSubtract (a: 'a list) (b: 'a list) =
         let unique = set b
         a |> List.filter (fun x -> unique.Contains x = false)
+
+module GraphExtensions =
+    open Dijkstra.NET.Graph
+    open Dijkstra.NET.ShortestPath
+    open System.Linq
+
+    let printAdjMatrix (adj: uint[,]) =
+        printfn "--------------"
+        for x in 0 .. (Array2D.length1 adj - 1) do
+          printf "| "
+          for y in 0 .. (Array2D.length2 adj - 1) do
+            printf " %d |" adj.[x,y]
+          printfn "\n--------------"
+
+    let dijkstra (nodes : uint32 seq) edges src dst = 
+        let src', dst' = src + 1u, dst  + 1u
+        let g = new Graph<int, string>()
+        let idMapper = new Dictionary<uint, uint>()
+        for n in nodes do
+            let nodeId = g.AddNode(int n)
+            idMapper.Add (n, nodeId)
+        let inversedIdMapper = idMapper.ToDictionary ((fun x -> x.Value), (fun x -> x.Key))
+        for (n1, n2, w) in edges do
+            let sourceId = idMapper[n1]
+            let destinationId = idMapper[n2]
+            g.Connect(sourceId, destinationId, w, $"{n1} to {n2} with cost {w}") |> ignore
+        let result = g.Dijkstra(src', dst')
+        result.GetPath() |> Seq.toList |> List.map (fun x -> inversedIdMapper[x]), result.Distance
 
 module PaperDataUtils = 
     let convertJsonValue (converter: JsonValue -> 'a) (props: ('b * JsonValue) array) =
@@ -272,34 +302,48 @@ module FrequenciesData =
 
 open NodaTime
 
-type ServerlessFunction = {
+type ServerlessFunction =  {
+    id: uint
     name: string
     deps: string list
 }
-with
-    member this.getFullDependencySize() =
-        this.deps
+
+[<RequireQualifiedAccess>]
+module ServerlessFunction =
+    let getFullDependencySize func =
+        func.deps
         |> List.map PackagesData.getFullPackageDataSafe 
         |> List.map (fun x -> x.install.bytes)
         |> List.sum
         |> (*) 1<dbyte>
-    member this.getNonCachedDependencySize (cachedFunc: ServerlessFunction) =
-        let notCachedDeps = DSExtensions.listSubtract this.deps cachedFunc.deps
+
+    let getNonCachedDependencySize (cachedFunc: ServerlessFunction) currentFunction =
+        let notCachedDeps = DSExtensions.listSubtract currentFunction.deps cachedFunc.deps
         notCachedDeps
         |> List.map PackagesData.getFullPackageDataSafe 
         |> List.map (fun x -> x.install.bytes)
         |> List.sum
         |> (*) 1<dbyte>
-    member this.fullRestorationDuration() = 
-        this.getFullDependencySize()
+
+    let fullRestorationDuration func = 
+        getFullDependencySize func
         |> float
         |> (*) 1.0<dbyte>
         |> General.calculateRestorationDuration
-    member this.nonCachedRestorationDuration (cachedFunc: ServerlessFunction) =
-        this.getNonCachedDependencySize cachedFunc
+
+    let nonCachedRestorationDuration (cachedFunc: ServerlessFunction) currentFunction =
+        currentFunction
+        |> getNonCachedDependencySize cachedFunc
         |> float
         |> (*) 1.0<dbyte>
         |> General.calculateRestorationDuration
+
+type GeneralizedServerlessFunction = InferedFromCoopContext | Concrete of ServerlessFunction
+with
+    member this.concrete() =
+        match this with
+        | Concrete f -> f
+        | InferedFromCoopContext -> failwith "concerete serverelss function isn't available because this function is infered"
 
 module ServerlessFunctionUtils = 
     open PackagesData
@@ -349,14 +393,16 @@ module FunctionGenerator =
         match deps with
         | DataUnawareRandomUniform c ->
             let nNames = getNRandomPackageNames c
-            [1..n] |> List.map (fun i -> {
+            [1u..n] |> List.map (fun i -> {
+                id = i - 1u
                 name = $"f{i}"
                 deps = nNames |> List.ofArray
             })
         | DataUnawareRandomNormal (m, s) ->
             let c = Normal.Sample(float m, float s) |> abs |> ceil |> int
             let names = getNRandomPackageNames c
-            [1..n] |> List.map (fun i -> {
+            [1u..n] |> List.map (fun i -> {
+                id = i - 1u
                 name = $"f{i}"
                 deps = names |> List.ofArray
             })
@@ -369,7 +415,8 @@ module FunctionGenerator =
 
             let probData = makeProbMap data
 
-            [1..n] |> List.map (fun i -> {
+            [1u..n] |> List.map (fun i -> {
+                id = i - 1u
                 name = $"f{i}"
                 deps = probData |> takeNFromProbMap c
             })
@@ -383,10 +430,17 @@ module FunctionGenerator =
             let probData = makeProbMap data
             let c = Normal.Sample(float m, float s) |> abs |> ceil |> int
 
-            [1..n] |> List.map (fun i -> {
+            [1u..n] |> List.map (fun i -> {
+                id = i - 1u
                 name = $"f{i}"
                 deps = probData |> takeNFromProbMap c
             })
+
+type CoopNetworkTemplate(numberOfFunctions: int) =
+    let n = numberOfFunctions
+    let graph = Array2D.init n n (fun _ _ -> General.rnd.NextDouble())
+    member _.Edge m n = graph[m, n]
+
 
 module QueueFunctionGeneration = 
     open General
@@ -408,9 +462,17 @@ module QueueFunctionGeneration =
 
 
 type QueueFunctionRequest = {
-    func: ServerlessFunction
+    func: GeneralizedServerlessFunction
     startTime: LocalTime
     serviceTime: Duration
+}
+with
+    member this.concreteFunc() = this.func.concrete()
+
+
+type QueueFunctionRequestBatch = {
+    funcs: ServerlessFunction list
+    requests: QueueFunctionRequest list
 }
 
 module QueueDataGenerator =
@@ -439,7 +501,7 @@ module QueueDataGenerator =
             let s = stdDevOf m
             Sample.normal m s rnd |> abs |> ceil |> int64 |> (*) 1L<second>
 
-    let generateFunctionQueueData (options: QueueFunctionGeneration.Options) (numberOfFunctions: int) = 
+    let generateFunctionQueueData (options: QueueFunctionGeneration.Options) numberOfFunctions = 
         let terminationCondition (prevTime: LocalTime) (newTime: LocalTime) =
             prevTime.Hour = 23 && newTime.Hour = 0
 
@@ -455,8 +517,8 @@ module QueueDataGenerator =
             else
                 let nextFunctionToPick = 
                     match coopMode with
-                    | IgnoreCoopNetwork -> pickRandomItemFromList funcList
-                    | UseCoopNetwork -> pickRandomItemFromList funcList // TODO: must be fixed
+                    | IgnoreCoopNetwork -> Concrete (pickRandomItemFromList funcList)
+                    | UseCoopNetwork -> InferedFromCoopContext // TODO: must be fixed
 
                 let newItem = {
                     func = nextFunctionToPick
@@ -466,10 +528,11 @@ module QueueDataGenerator =
 
                 generate startTime (result@[newItem])
             
-        generate (LocalTime(0,0,0)) []
+        { funcs = funcList; requests = generate (LocalTime(0,0,0)) [] }
         
 type Container = {
     name: string
+    id: uint
     runningFunction: ServerlessFunction option
     created: LocalTime
     finishedExecTime: LocalTime option
@@ -477,44 +540,50 @@ type Container = {
     totalWorkingDuration: Duration
     totalWaitForNextFunctionDuration: Duration
     totalRestorationDuration: Duration
-    chanceofWatiningMore: float 
+    chanceOfWaitingMore: float
+    chanceOfWaitingMoreMaximumValue: float
     previousFunctions: ServerlessFunction list
     mountKey: Guid // A key to keep track of changes in the container status of being occupied by different functions
 }
-    with
-        member this.isDisposed() = this.disposed.IsSome
-        member this.numberOfTimesUsed() = this.previousFunctions |> List.length
-        member this.isWaitingForNextFunction() = this.finishedExecTime.IsSome && (this.isDisposed() |> not)
-        static member makeNew name func created =
-            {
-                name = name
-                runningFunction = func
-                created = created
-                finishedExecTime = None
-                disposed = None
-                totalWorkingDuration = Duration.Zero
-                totalWaitForNextFunctionDuration = Duration.Zero
-                totalRestorationDuration = Duration.Zero
-                chanceofWatiningMore = 0.0
-                previousFunctions = []
+
+[<RequireQualifiedAccess>]
+module Container =
+    let makeNew name id func created =
+        {
+            name = name
+            id = id
+            runningFunction = func
+            created = created
+            finishedExecTime = None
+            disposed = None
+            totalWorkingDuration = Duration.Zero
+            totalWaitForNextFunctionDuration = Duration.Zero
+            totalRestorationDuration = Duration.Zero
+            chanceOfWaitingMore = 0.0
+            chanceOfWaitingMoreMaximumValue = 1.0
+            previousFunctions = []
+            mountKey = Guid.NewGuid()
+        }
+    let isDisposed cnt = cnt.disposed.IsSome
+    let numberOfTimesUsed cnt = cnt.previousFunctions |> List.length
+    let isWaitingForNextFunction cnt = cnt.finishedExecTime.IsSome && (isDisposed cnt|> not)
+    let terminate disposeTime cnt =
+        {
+            cnt with 
+                disposed = Some disposeTime
+                finishedExecTime = Some disposeTime
+                runningFunction = None
+                previousFunctions = match cnt.runningFunction with Some x -> cnt.previousFunctions@[x] | _ -> cnt.previousFunctions
                 mountKey = Guid.NewGuid()
-            }
-        member this.terminate disposeTime =
-            {
-                this with 
-                    disposed = Some disposeTime
-                    finishedExecTime = Some disposeTime
-                    runningFunction = None
-                    previousFunctions = match this.runningFunction with Some x -> this.previousFunctions@[x] | _ -> this.previousFunctions
-                    mountKey = Guid.NewGuid()
-            }
-        member this.finishExec finishTime =
-            { this with finishedExecTime = Some finishTime; mountKey = Guid.NewGuid() }
+        }
+    let finishExec finishTime cnt =
+        { cnt with finishedExecTime = Some finishTime; mountKey = Guid.NewGuid() }
 
 type TimelineEventKind =
     | QueueRequest of QueueFunctionRequest // A new function wants to run in the serverless platform
     | FinishRunningFunction of Container // A function finished its execution in container
     | MountWaitTimedOut of Container * mountKey: Guid // Container waited some time epoch for another function to join but nothing happened
+    | EvaporateCoopNetEdges
 
 [<CustomComparison;CustomEquality>]
 type TimelineEvent = {
@@ -533,26 +602,154 @@ type TimelineEvent = {
             | :? TimelineEvent as y -> compare (x.time) (y.time)
             | _ -> invalidArg "yobj" "cannot compare value of different types"
 
+[<RequireQualifiedAccess>]
+module TimelineEvent =
+    let insertEvent (item: TimelineEvent) (evList: TimelineEvent list) =
+        DSExtensions.insertSorted item evList
+
+type DependencyGraph = {
+    adjMatrix: uint[,]
+    numberOfFunctions: uint
+}
+
+[<RequireQualifiedAccess>]
+module DependencyGraph =
+    let init numberOfFunctions = 
+        let l = int numberOfFunctions
+        let graph = Array2D.init l l (fun _ _ -> if General.rnd.NextDouble() < 0.5 then 0u else General.rnd.Next(1, 1000) |> uint)
+        { adjMatrix = graph; numberOfFunctions = numberOfFunctions }
+
+    let incr n m graph =
+        let newAdjMatrix =  Array2D.copy graph.adjMatrix
+        newAdjMatrix[n, m] <- newAdjMatrix[n, m] + 1u
+
+        { graph with adjMatrix = newAdjMatrix }
+        
+    let incrAll list graph =
+        let newAdjMatrix = Array2D.copy graph.adjMatrix
+        for (n, m) in list do
+            let n', m' = int n, int m
+            newAdjMatrix[n', m'] <- newAdjMatrix[n', m'] + 1u
+
+        { graph with adjMatrix = newAdjMatrix }
+
+    let evaporate graph =
+        let newArray =
+            graph.adjMatrix
+            |> Array2D.map (fun x -> max 0u (x - 1u))
+            
+        { graph with adjMatrix = newArray }
+
+    let edgesOf verticeId graph =
+        graph.adjMatrix[verticeId, *]
+
+    let neighbourIds verticeId graph =
+        graph |> edgesOf verticeId
+        |> Array.indexed
+        |> Array.filter (fun (_, value) -> value > 0u)
+        |> Array.map (fun (index, _) -> index)
+
+    let dijkestraPath sourceId destinationId graph =
+        let n = int graph.numberOfFunctions
+        let nodes = seq {
+            for i = 0 to n-1 do
+                yield (uint i)
+        }
+        let edges =
+            seq {
+                for i = 0 to n-1 do
+                    for j = 0 to n-1 do
+                        let v = graph.adjMatrix[i, j]
+                        if i <> j && v <> 0u then yield (uint i, uint j, int v)
+            }
+            
+        GraphExtensions.dijkstra nodes edges sourceId destinationId
+
+    let edgeWeightsFromPath (path: uint list) graph =
+        let adj = graph.adjMatrix
+
+        let rec weights currentPath result =
+            match currentPath with
+            | [] -> result
+            | x::y::rest ->
+                let newResult = result@[adj[int x, int y]]
+                let newPath = y::rest
+                weights newPath newResult
+            | x::[] -> result
+
+        weights path []
+
+    let dijkestra sourceId destinationId graph =
+        let path, distance = graph |> dijkestraPath sourceId destinationId
+        let weights = graph |> edgeWeightsFromPath path
+
+        path, weights, distance
+
+    let coopScore f1Id f2Id graph =
+        let rec score p edgeWeights =
+            match edgeWeights with
+            | [] -> p
+            | currentEdge::restEdges ->
+                let newP = p * (float currentEdge |> General.normalize)
+                score newP restEdges
+
+        let path, distance = graph |> dijkestraPath f1Id f2Id
+        let weights = graph |> edgeWeightsFromPath path
+
+        match weights with [] -> 0. | xs -> score 1. xs
+
+type MergeStatusKind = SuccessfulMerge | FailedMerge
+type MergeStatus = MergeStatusKind * LocalTime
 
 type SimulatorContext = {
     day: string
     events: TimelineEvent list
-    containerIdCounter: int
+    containerIdCounter: uint
     containers: Map<string, Container>
+    dependencyGraph: DependencyGraph
+    functionsMergeStatuses: Map<uint, MergeStatus list>
 }
-with
-    member this.getMountableContainers() =
-        this.containers.Values
+
+[<RequireQualifiedAccess>]
+module SimulatorContext =
+    let getMountableContainers ctx =
+        ctx.containers.Values
         |> List.ofSeq
-        |> List.filter (fun x -> x.isWaitingForNextFunction())
+        |> List.filter Container.isWaitingForNextFunction
+    let getRunningFunctions ctx =
+        ctx.containers.Values
+        |> List.ofSeq
+        |> List.filter (fun x -> not(Container.isDisposed x) && not(Container.isWaitingForNextFunction x))
+        |> List.map (fun x -> x.runningFunction)
+        //|> List.filter (fun x -> x.IsSome)
+        |> List.distinctBy (fun x -> x.Value.name)
+        |> List.map (fun x -> x.Value)
+    let updateContainer cont ctx =
+        { ctx with
+            containers = ctx.containers |> Map.add cont.name cont
+        }
+    let updateDependencyGraph newGraph ctx =
+        { ctx with dependencyGraph = newGraph }
+    let insertEvent ev ctx =
+        { ctx with 
+            events = ctx.events |> TimelineEvent.insertEvent ev
+        }
+    let private addNewFunctionMergeStatus functionId time kind ctx =
+        let mergeStatus = ctx.functionsMergeStatuses[functionId]
+        let newItem = kind, time
+        { ctx with
+            functionsMergeStatuses = ctx.functionsMergeStatuses |> Map.add functionId (mergeStatus@[newItem])
+        }
+    let functionMergeFailed functionId time ctx =
+        ctx |> addNewFunctionMergeStatus functionId time FailedMerge
+    let functionMergeSuccesfull functionId time ctx =
+        ctx |> addNewFunctionMergeStatus functionId time SuccessfulMerge
 
 type Scheduler = TimelineEvent -> SimulatorContext -> SimulatorContext
 
 module Simulator =
     open DSExtensions
-    let insertEvent (item: TimelineEvent) (evList: TimelineEvent list) =
-        insertSorted item evList
-
+    let insertEvent = TimelineEvent.insertEvent
     let rec runSimulation (scheduler: Scheduler) (context: SimulatorContext) =
         match context.events with
         | [] -> context
@@ -561,19 +758,28 @@ module Simulator =
             let newContext = scheduler event popEventContext
             runSimulation scheduler newContext
 
-    let convertQueueRequestDataToSimulatorContext (day: string) (queueFuncReq: QueueFunctionRequest list) =
+    let convertQueueRequestDataToSimulatorContext (day: string) (queueFuncReqBatch: QueueFunctionRequestBatch) =
+        let funcLen = uint queueFuncReqBatch.funcs.Length
         {
             day = day
-            events = queueFuncReq |> List.map (fun qfr -> { time = qfr.startTime ; kind = QueueRequest qfr })
-            containerIdCounter = 0
+            events =
+                queueFuncReqBatch.requests
+                |> List.map (fun qfr -> { time = qfr.startTime ; kind = QueueRequest qfr })
+                |> insertEvent ({ time = LocalTime(0,0,0) ; kind = EvaporateCoopNetEdges })
+            containerIdCounter = 0u
             containers = Map.empty
+            dependencyGraph = DependencyGraph.init funcLen
+            functionsMergeStatuses =
+                queueFuncReqBatch.funcs
+                |> List.map (fun f -> f.id, [])
+                |> Map.ofList
         }
 
-    let runSimulatonWithQueueData (day: string) (queueFuncData: QueueFunctionRequest list) (scheduler: Scheduler) =
+    let runSimulatonWithQueueData (day: string) (queueFuncData: QueueFunctionRequestBatch) (scheduler: Scheduler) =
         let ctx = convertQueueRequestDataToSimulatorContext day queueFuncData
         runSimulation scheduler ctx
 
-module Schedulers =
+module BasicSchedulers =
     open General
     open Simulator
     let doNothingScheduler : Scheduler = fun _ ctx -> ctx
@@ -581,23 +787,26 @@ module Schedulers =
         let (time, kind) = ev.time, ev.kind
         match kind with
         | QueueRequest qfr ->
-            let restoreDuration = qfr.func.fullRestorationDuration()
+            let f = qfr.concreteFunc()
+            let restoreDuration = ServerlessFunction.fullRestorationDuration f
             let functionFinish = time.PlusNanoseconds((restoreDuration + qfr.serviceTime).ToInt64Nanoseconds())
             let newContainer = {
                 name = $"container-%d{ctx.containerIdCounter}"
-                runningFunction = Some qfr.func
+                id = ctx.containerIdCounter
+                runningFunction = Some f
                 created = time
                 finishedExecTime = None
                 disposed = None
                 totalRestorationDuration = restoreDuration
                 totalWaitForNextFunctionDuration = Duration.Zero
                 totalWorkingDuration = qfr.serviceTime
-                chanceofWatiningMore = 0.0
+                chanceOfWaitingMore = 0.0
+                chanceOfWaitingMoreMaximumValue = 1.0
                 previousFunctions = []
                 mountKey = Guid.NewGuid()
             }
             { ctx with
-                containerIdCounter = ctx.containerIdCounter + 1
+                containerIdCounter = ctx.containerIdCounter + 1u
                 containers = ctx.containers |> Map.add newContainer.name newContainer
                 events = ctx.events |> insertEvent {
                     time = functionFinish
@@ -605,7 +814,7 @@ module Schedulers =
                 }
             }
         | FinishRunningFunction container -> 
-            let terminatedContainer = container.terminate ev.time
+            let terminatedContainer = container |> Container.terminate ev.time
             let newConts = ctx.containers |> Map.add container.name terminatedContainer
             { ctx with containers = newConts }
         | _ -> ctx
@@ -614,26 +823,29 @@ module Schedulers =
         let (time, kind) = ev.time, ev.kind
         match kind with
         | QueueRequest qfr ->
-            let mountConts = ctx.getMountableContainers()
+            let mountConts = ctx |> SimulatorContext.getMountableContainers
             match mountConts with
             | [] ->
-                let restoreDuration = qfr.func.fullRestorationDuration()
+                let f = qfr.concreteFunc()
+                let restoreDuration =  ServerlessFunction.fullRestorationDuration f
                 let functionFinish = time.PlusNanoseconds((restoreDuration + qfr.serviceTime).ToInt64Nanoseconds())
                 let newContainer = {
                     name = $"container-%d{ctx.containerIdCounter}"
-                    runningFunction = Some qfr.func
+                    id = ctx.containerIdCounter
+                    runningFunction = Some f
                     created = time
                     finishedExecTime = None
                     disposed = None
                     totalRestorationDuration = restoreDuration
                     totalWaitForNextFunctionDuration = Duration.Zero
                     totalWorkingDuration = qfr.serviceTime
-                    chanceofWatiningMore = 0.0
+                    chanceOfWaitingMore = 0.0
+                    chanceOfWaitingMoreMaximumValue = 1.0
                     previousFunctions = []
                     mountKey = Guid.NewGuid()
                 }
                 { ctx with
-                    containerIdCounter = ctx.containerIdCounter + 1
+                    containerIdCounter = ctx.containerIdCounter + 1u
                     containers = ctx.containers |> Map.add newContainer.name newContainer
                     events = ctx.events |> insertEvent {
                         time = functionFinish
@@ -641,13 +853,14 @@ module Schedulers =
                     }
                 }
             | conts ->
+                let f = qfr.concreteFunc()
                 let host = DSExtensions.pickRandomItemFromList conts
-                let restorationTime = qfr.func.nonCachedRestorationDuration host.runningFunction.Value
+                let restorationTime = f |> ServerlessFunction.nonCachedRestorationDuration host.runningFunction.Value
                 let waitTime = (time - host.finishedExecTime.Value).ToDuration()
                 let finishTime = time.PlusNanoseconds((restorationTime + qfr.serviceTime).ToInt64Nanoseconds())
                 let modifiedHost = {
                     host with
-                        runningFunction = Some qfr.func
+                        runningFunction = Some f
                         finishedExecTime = None
                         totalRestorationDuration = host.totalRestorationDuration + restorationTime
                         totalWaitForNextFunctionDuration = host.totalWaitForNextFunctionDuration + waitTime
@@ -683,9 +896,13 @@ module Schedulers =
         | MountWaitTimedOut (cont, key) ->
             let targetCont = ctx.containers.[cont.name]
             if key = targetCont.mountKey then
-                ctx
+                let terminatedCont = targetCont |> Container.terminate time
+                { ctx with
+                    containers = ctx.containers |> Map.add terminatedCont.name terminatedCont
+                }
             else
                 ctx
+        | EvaporateCoopNetEdges -> ctx
 
     let staticWaitScheduler (waitTime: int<second>): Scheduler =
         computedWaitScheduler (fun () -> waitTime)
@@ -693,4 +910,180 @@ module Schedulers =
     let randomWaitScheduler (mean: int<second>) (stddev: int<second>): Scheduler =
         computedWaitScheduler (fun () -> Normal.Sample (float mean, float stddev) |> ceil |> int |> (*) 1<second>)
 
-    let dynamicWaitScheduler = 0
+
+module ComplexSchedulers =
+    open General
+    open Simulator
+    open ServerlessFunctionUtils
+
+    type RLAction = 
+        | WaitMore of chanceDiff: float 
+        | WaitLess of chanceDiff: float
+        | Neutral
+        | Terminate
+
+    type RLPolicy = SimulatorContext -> Container -> RLAction
+
+    type DynamicSchedulerConfiguration = {
+        stepCost: float
+        maxWaitChanceCost: float
+        waitTimeoutSeconds: int
+    }
+
+    let defaultDynamicSchedulerConfig = {
+        stepCost = 0.05
+        maxWaitChanceCost = 0.01
+        waitTimeoutSeconds = 10
+    }
+
+    let dynamicWaitScheduler (policy: RLPolicy) (config: DynamicSchedulerConfiguration option): Scheduler = fun ev ctx ->
+        let (time, kind) = ev.time, ev.kind
+        let conf = match config with Some c -> c | None -> defaultDynamicSchedulerConfig
+        match kind with
+        | QueueRequest qfr ->
+            let f = qfr.concreteFunc()
+            let mountConts = ctx |> SimulatorContext.getMountableContainers
+            let running = ctx |> SimulatorContext.getRunningFunctions
+            let incrementEdgeValuesSeq = seq {
+                for r in running do
+                    yield (r.id, f.id)
+            }
+            let newDependencyGraph = ctx.dependencyGraph |> DependencyGraph.incrAll incrementEdgeValuesSeq
+            match mountConts with
+            | [] ->
+                let restoreDuration = ServerlessFunction.fullRestorationDuration f
+                let functionFinish = time.PlusNanoseconds((restoreDuration + qfr.serviceTime).ToInt64Nanoseconds())
+                let newContainer = {
+                    name = $"container-%d{ctx.containerIdCounter}"
+                    id = ctx.containerIdCounter
+                    runningFunction = Some f
+                    created = time
+                    finishedExecTime = None
+                    disposed = None
+                    totalRestorationDuration = restoreDuration
+                    totalWaitForNextFunctionDuration = Duration.Zero
+                    totalWorkingDuration = qfr.serviceTime
+                    chanceOfWaitingMore = 1.0
+                    chanceOfWaitingMoreMaximumValue = 1.0
+                    previousFunctions = []
+                    mountKey = Guid.NewGuid()
+                }
+                { ctx with
+                    containerIdCounter = ctx.containerIdCounter + 1u
+                    containers = ctx.containers |> Map.add newContainer.name newContainer
+                    events = ctx.events |> insertEvent {
+                        time = functionFinish
+                        kind = FinishRunningFunction newContainer
+                    }
+                    dependencyGraph = newDependencyGraph
+                }
+            | conts ->
+                let host =
+                    conts |>
+                    List.maxBy (fun c -> similarity f (c.runningFunction.Value))
+                let restorationTime = f |> ServerlessFunction.nonCachedRestorationDuration host.runningFunction.Value
+                let waitTime = (time - host.finishedExecTime.Value).ToDuration()
+                let finishTime = time.PlusNanoseconds((restorationTime + qfr.serviceTime).ToInt64Nanoseconds())
+                let modifiedHost = {
+                    host with
+                        runningFunction = Some f
+                        finishedExecTime = None
+                        totalRestorationDuration = host.totalRestorationDuration + restorationTime
+                        totalWaitForNextFunctionDuration = host.totalWaitForNextFunctionDuration + waitTime
+                        totalWorkingDuration = host.totalWorkingDuration + qfr.serviceTime
+                        previousFunctions = host.previousFunctions @ [host.runningFunction.Value]
+                        mountKey = Guid.NewGuid()
+                }
+
+                ctx
+                    |> SimulatorContext.updateContainer modifiedHost
+                    |> SimulatorContext.insertEvent { time = finishTime; kind = FinishRunningFunction modifiedHost }
+                    |> SimulatorContext.updateDependencyGraph newDependencyGraph
+                    |> SimulatorContext.functionMergeSuccesfull host.runningFunction.Value.id time
+
+
+        | FinishRunningFunction cont ->
+            let nextEventTime = time.PlusSeconds(conf.waitTimeoutSeconds)
+            let newKey = Guid.NewGuid()
+            let newCont = {
+                cont with
+                    finishedExecTime = Some time
+                    mountKey = newKey
+            }
+            { ctx with
+                containers = ctx.containers |> Map.add newCont.name newCont
+                events = ctx.events |> insertEvent {
+                    time = nextEventTime
+                    kind = MountWaitTimedOut (newCont, newKey)
+                }
+            }
+        | MountWaitTimedOut (cont, key) ->
+            let targetCont = ctx.containers.[cont.name]
+            if key <> targetCont.mountKey then ctx
+            else
+                let action = policy ctx targetCont
+                let newMaxWaitChance = max 0. (cont.chanceOfWaitingMoreMaximumValue - conf.maxWaitChanceCost)
+                let newWaitMoreOdds = max 0. (cont.chanceOfWaitingMore - conf.stepCost)
+
+                let shouldTerminate odds =
+                    let rndValue = General.rnd.NextDouble()
+                    if (odds <= 0.) || (rndValue <= odds) then true else false
+
+                let inline between minValue maxValue value = value |> max minValue |> min maxValue
+
+                let terminatedContext diff = 
+                    let terminatedCont = 
+                        { Container.terminate time targetCont with
+                            chanceOfWaitingMore = newWaitMoreOdds + diff |> between 0. newMaxWaitChance
+                            chanceOfWaitingMoreMaximumValue = newMaxWaitChance
+                        }
+
+                    ctx
+                        |> SimulatorContext.updateContainer terminatedCont
+                        |> SimulatorContext.functionMergeFailed (cont.runningFunction.Value.id) time
+
+                let continueWaitingContext chanceDiff =
+                    
+                    let newCont =
+                        let newChance = newWaitMoreOdds + chanceDiff |> between 0. newMaxWaitChance
+                        { targetCont with
+                            chanceOfWaitingMoreMaximumValue = newMaxWaitChance
+                            chanceOfWaitingMore = newChance
+                        }
+
+                    let nextEventTime = time.PlusSeconds(conf.waitTimeoutSeconds)
+                    let nextCheckEvent = { time = nextEventTime; kind = MountWaitTimedOut (newCont, key) }
+                    let updatedCtx = ctx |> SimulatorContext.updateContainer newCont
+                    { updatedCtx with 
+                        events = ctx.events |> insertEvent nextCheckEvent
+                    }
+
+                match action with
+                | Terminate -> terminatedContext 0.
+                | Neutral ->
+                    if shouldTerminate newWaitMoreOdds then terminatedContext 0.
+                    else
+                        continueWaitingContext 0.
+                        
+                | WaitMore chanceDiff ->
+                    let newChance = newWaitMoreOdds + chanceDiff
+                    if shouldTerminate newChance then terminatedContext chanceDiff
+                    else continueWaitingContext chanceDiff
+                | WaitLess chanceDiff ->
+                    let newChance = newWaitMoreOdds - chanceDiff
+                    if shouldTerminate newChance then terminatedContext (-chanceDiff)
+                    else continueWaitingContext (-chanceDiff)
+                    
+
+        | EvaporateCoopNetEdges ->
+            let newEvaporateEvent = { time = time.PlusMinutes(1); kind = EvaporateCoopNetEdges }
+            { ctx with 
+                dependencyGraph = DependencyGraph.evaporate ctx.dependencyGraph
+                events = ctx.events |> insertEvent newEvaporateEvent
+            }
+
+module DynamicSchedulerPolicies =
+    open ComplexSchedulers
+
+    let alwaysNeturalPolicy : RLPolicy = fun ctx cont ->
+        Neutral
