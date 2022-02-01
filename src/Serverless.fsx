@@ -6,6 +6,10 @@ open System.Text.Json.Serialization
 open System.Collections.Generic
 open MathNet.Numerics.Distributions
 open System.Security.Cryptography
+open MathNet.Numerics
+open NodaTime
+open NodaTime
+open NodaTime
 
 #r "nuget: FSharp.Data"
 #r "nuget: NodaTime"
@@ -24,6 +28,7 @@ open System.Text.Json.Serialization
 [<Measure>] type dbyte
 [<Measure>] type kilobyte
 [<Measure>] type megabyte
+[<Measure>] type hour
 
 module General =
     open MathNet.Numerics.Distributions
@@ -43,8 +48,13 @@ module General =
 
     let PackageRestoreSpeed = 2.<second/megabyte>
 
+    let PurgeMergeStatusesBeforeInHours = 1.<hour>
+
+    let ContainerCreationCostInSeconds_DefaultChiSquareFreedom = 5.0
 
     let inline weilbullStretched x a b = 1. - (Math.E ** (-1. * ((x/a) ** b)))
+
+    /// Returns a number between 0. and 1.
     let inline normalize x = min 1. (weilbullStretched x 5. 2.)
 
     let inline bytesToKilobytes (x: float<dbyte>) = x / (1000.0<dbyte/kilobyte>)
@@ -61,10 +71,17 @@ module General =
 
     let calculateRestorationDuration (size: float<dbyte>) =
         size |> calculateRestorationTime |> int64 |> Duration.FromSeconds
- 
+
 module NodaTimeUtils =
+    open NodaTime
     let addDuration (d: Duration) (lt: LocalTime) =
         lt.PlusTicks(d.TotalTicks |> int64)
+
+    let avgDurations (durations: Duration list) =
+        durations
+        |> List.averageBy (fun x -> x.TotalSeconds)
+        |> Duration.FromSeconds
+
 
 module DSExtensions =
     open General
@@ -338,14 +355,6 @@ module ServerlessFunction =
         |> (*) 1.0<dbyte>
         |> General.calculateRestorationDuration
 
-type GeneralizedServerlessFunction = InferedFromCoopContext | Concrete of ServerlessFunction
-with
-    member this.concrete() =
-        match this with
-        | Concrete f -> f
-        | InferedFromCoopContext -> failwith "concerete serverelss function isn't available because this function is infered"
-
-module ServerlessFunctionUtils = 
     open PackagesData
     open System.Linq
     open General
@@ -366,6 +375,12 @@ module ServerlessFunctionUtils =
 
             normalize intersect
 
+type GeneralizedServerlessFunction = InferedFromCoopContext | Concrete of ServerlessFunction
+with
+    member this.concrete() =
+        match this with
+        | Concrete f -> f
+        | InferedFromCoopContext -> failwith "concerete serverelss function isn't available because this function is infered"
 
 
 type EnvironmentContext = {
@@ -456,7 +471,10 @@ module QueueFunctionGeneration =
         | IgnoreFrequencyData
         | UseFrequencyData of Map<DayOfWeekName,Map<FreqHour,int>>
 
+    let defaultUnawareRandomUniformDepsCount = DataUnawareRandomUniform NumberOfFunctionDeps_DefaultNormalDistMean
     let defaultUnawareRandomNormalDepsCount = DataUnawareRandomNormal (NumberOfFunctionDeps_DefaultNormalDistMean, NumberOfFunctionDeps_DefaultNormalDistStdDev)
+
+    let defaultAwareRandomUniformDepsCount = DataAwareRandomUniform (None, NumberOfFunctionDeps_DefaultNormalDistMean)
     let defaultAwareRandomNormalDepsCount = DataAwareRandomNormal (None, NumberOfFunctionDeps_DefaultNormalDistMean, NumberOfFunctionDeps_DefaultNormalDistStdDev)
     type Options = FrequencyOfInvocationMode * FunctionCoopMode * FunctionGenerateOptions.DependenciesCount
 
@@ -535,6 +553,7 @@ type Container = {
     id: uint
     runningFunction: ServerlessFunction option
     created: LocalTime
+    creationDuration: Duration
     finishedExecTime: LocalTime option
     disposed: LocalTime option
     totalWorkingDuration: Duration
@@ -554,6 +573,7 @@ module Container =
             id = id
             runningFunction = func
             created = created
+            creationDuration = Duration.Zero
             finishedExecTime = None
             disposed = None
             totalWorkingDuration = Duration.Zero
@@ -578,6 +598,11 @@ module Container =
         }
     let finishExec finishTime cnt =
         { cnt with finishedExecTime = Some finishTime; mountKey = Guid.NewGuid() }
+
+    let randomCreationDuration () =
+        General.rnd
+        |> Sample.chiSquared General.ContainerCreationCostInSeconds_DefaultChiSquareFreedom
+        |> Duration.FromSeconds
 
 type TimelineEventKind =
     | QueueRequest of QueueFunctionRequest // A new function wants to run in the serverless platform
@@ -712,10 +737,12 @@ type SimulatorContext = {
 
 [<RequireQualifiedAccess>]
 module SimulatorContext =
+    open General
     let getMountableContainers ctx =
         ctx.containers.Values
         |> List.ofSeq
         |> List.filter Container.isWaitingForNextFunction
+
     let getRunningFunctions ctx =
         ctx.containers.Values
         |> List.ofSeq
@@ -724,26 +751,69 @@ module SimulatorContext =
         //|> List.filter (fun x -> x.IsSome)
         |> List.distinctBy (fun x -> x.Value.name)
         |> List.map (fun x -> x.Value)
+
     let updateContainer cont ctx =
         { ctx with
             containers = ctx.containers |> Map.add cont.name cont
         }
+
     let updateDependencyGraph newGraph ctx =
         { ctx with dependencyGraph = newGraph }
+
     let insertEvent ev ctx =
         { ctx with 
             events = ctx.events |> TimelineEvent.insertEvent ev
         }
+
     let private addNewFunctionMergeStatus functionId time kind ctx =
         let mergeStatus = ctx.functionsMergeStatuses[functionId]
         let newItem = kind, time
         { ctx with
             functionsMergeStatuses = ctx.functionsMergeStatuses |> Map.add functionId (mergeStatus@[newItem])
         }
+
     let functionMergeFailed functionId time ctx =
         ctx |> addNewFunctionMergeStatus functionId time FailedMerge
+
     let functionMergeSuccesfull functionId time ctx =
         ctx |> addNewFunctionMergeStatus functionId time SuccessfulMerge
+        
+    let purgeOldMergeStatuses now ctx =
+        let isNew ((_, time): MergeStatus) =
+            (now - time).ToDuration().TotalHours <= (float PurgeMergeStatusesBeforeInHours)
+
+        let newMergeStatuses =
+            seq {
+                for item in ctx.functionsMergeStatuses do
+                    let newItems = item.Value |> List.filter isNew
+                    yield item.Key, newItems
+            }
+            |> Map.ofSeq
+
+        { ctx with functionsMergeStatuses = newMergeStatuses }
+
+    let functionMergeSuccessRate functionId ctx =
+        let statuses = ctx.functionsMergeStatuses[functionId]
+        let success = statuses |> List.filter (fun (k, _) -> k = SuccessfulMerge) |> List.length |> float
+        let total = statuses |> List.length |> float
+        
+        success / total
+
+    let coopScore fSourceId fDestId ctx =
+        ctx.dependencyGraph|> DependencyGraph.coopScore fSourceId fDestId
+
+    let getContainers ctx =
+        Map.values ctx.containers |> List.ofSeq
+
+    let getTotalTimes ctx =
+        let cnts = getContainers ctx
+        let creation = cnts |> List.sumBy (fun x -> x.creationDuration)
+        let working = cnts |> List.sumBy (fun x -> x.totalWorkingDuration)
+        let waiting = cnts |> List.sumBy (fun x -> x.totalWaitForNextFunctionDuration)
+        let restoration = cnts |> List.sumBy (fun x -> x.totalRestorationDuration)
+
+        (creation, working, waiting, restoration)
+
 
 type Scheduler = TimelineEvent -> SimulatorContext -> SimulatorContext
 
@@ -789,12 +859,15 @@ module BasicSchedulers =
         | QueueRequest qfr ->
             let f = qfr.concreteFunc()
             let restoreDuration = ServerlessFunction.fullRestorationDuration f
-            let functionFinish = time.PlusNanoseconds((restoreDuration + qfr.serviceTime).ToInt64Nanoseconds())
+            let containerCreationDuration = Container.randomCreationDuration()
+            let lifetimeDuration = containerCreationDuration + restoreDuration + qfr.serviceTime
+            let functionFinish = time.PlusNanoseconds(lifetimeDuration.ToInt64Nanoseconds())
             let newContainer = {
                 name = $"container-%d{ctx.containerIdCounter}"
                 id = ctx.containerIdCounter
                 runningFunction = Some f
                 created = time
+                creationDuration = containerCreationDuration
                 finishedExecTime = None
                 disposed = None
                 totalRestorationDuration = restoreDuration
@@ -828,12 +901,15 @@ module BasicSchedulers =
             | [] ->
                 let f = qfr.concreteFunc()
                 let restoreDuration =  ServerlessFunction.fullRestorationDuration f
-                let functionFinish = time.PlusNanoseconds((restoreDuration + qfr.serviceTime).ToInt64Nanoseconds())
+                let containerCreationDuration = Container.randomCreationDuration()
+                let lifetimeDuration = containerCreationDuration + restoreDuration + qfr.serviceTime
+                let functionFinish = time.PlusNanoseconds(lifetimeDuration.ToInt64Nanoseconds())
                 let newContainer = {
                     name = $"container-%d{ctx.containerIdCounter}"
                     id = ctx.containerIdCounter
                     runningFunction = Some f
                     created = time
+                    creationDuration = containerCreationDuration
                     finishedExecTime = None
                     disposed = None
                     totalRestorationDuration = restoreDuration
@@ -914,7 +990,6 @@ module BasicSchedulers =
 module ComplexSchedulers =
     open General
     open Simulator
-    open ServerlessFunctionUtils
 
     type RLAction = 
         | WaitMore of chanceDiff: float 
@@ -936,8 +1011,9 @@ module ComplexSchedulers =
         waitTimeoutSeconds = 10
     }
 
-    let dynamicWaitScheduler (policy: RLPolicy) (config: DynamicSchedulerConfiguration option): Scheduler = fun ev ctx ->
+    let dynamicWaitScheduler (policy: RLPolicy) (config: DynamicSchedulerConfiguration option): Scheduler = fun ev originalContext ->
         let (time, kind) = ev.time, ev.kind
+        let ctx = originalContext |> SimulatorContext.purgeOldMergeStatuses time
         let conf = match config with Some c -> c | None -> defaultDynamicSchedulerConfig
         match kind with
         | QueueRequest qfr ->
@@ -952,12 +1028,15 @@ module ComplexSchedulers =
             match mountConts with
             | [] ->
                 let restoreDuration = ServerlessFunction.fullRestorationDuration f
-                let functionFinish = time.PlusNanoseconds((restoreDuration + qfr.serviceTime).ToInt64Nanoseconds())
+                let containerCreationDuration = Container.randomCreationDuration()
+                let lifetimeDuration = containerCreationDuration + restoreDuration + qfr.serviceTime
+                let functionFinish = time.PlusNanoseconds(lifetimeDuration.ToInt64Nanoseconds())
                 let newContainer = {
                     name = $"container-%d{ctx.containerIdCounter}"
                     id = ctx.containerIdCounter
                     runningFunction = Some f
                     created = time
+                    creationDuration = containerCreationDuration
                     finishedExecTime = None
                     disposed = None
                     totalRestorationDuration = restoreDuration
@@ -980,7 +1059,7 @@ module ComplexSchedulers =
             | conts ->
                 let host =
                     conts |>
-                    List.maxBy (fun c -> similarity f (c.runningFunction.Value))
+                    List.maxBy (fun c -> ServerlessFunction.similarity f (c.runningFunction.Value))
                 let restorationTime = f |> ServerlessFunction.nonCachedRestorationDuration host.runningFunction.Value
                 let waitTime = (time - host.finishedExecTime.Value).ToDuration()
                 let finishTime = time.PlusNanoseconds((restorationTime + qfr.serviceTime).ToInt64Nanoseconds())
@@ -1081,9 +1160,74 @@ module ComplexSchedulers =
                 dependencyGraph = DependencyGraph.evaporate ctx.dependencyGraph
                 events = ctx.events |> insertEvent newEvaporateEvent
             }
+module ProbabilityUtils =
+    let unionOfIndependentEvents probs =
+        let inversedProbs = probs |> List.map (fun x -> 1. - x)
+        1. - (List.reduce (*) probs)
 
 module DynamicSchedulerPolicies =
     open ComplexSchedulers
+    
 
     let alwaysNeturalPolicy : RLPolicy = fun ctx cont ->
         Neutral
+
+    let contextBasedPolicy : RLPolicy = fun ctx cont ->
+        let rf = cont.runningFunction.Value // running function
+        let prevSuccessRate = ctx |> SimulatorContext.functionMergeSuccessRate (rf.id) // probability
+        let coopWithRunningFunctionsProbability = // probability
+            ctx
+            |> SimulatorContext.getRunningFunctions
+            |> List.map (fun fSource -> ctx |> SimulatorContext.coopScore fSource.id rf.id) // array of probabilities
+            |> ProbabilityUtils.unionOfIndependentEvents
+
+        let similarityScoreProb = // probability
+            ctx
+            |> SimulatorContext.getRunningFunctions
+            |> List.map (fun fSource -> ServerlessFunction.similarity fSource rf) // array of probs
+            |> ProbabilityUtils.unionOfIndependentEvents
+
+        let prob =
+            [ prevSuccessRate; coopWithRunningFunctionsProbability; similarityScoreProb ]
+            |> ProbabilityUtils.unionOfIndependentEvents
+
+        match prob with
+        | x when x > 1.0 -> failwith "Probability of context-based policy was calculated more than 1."
+        | x when x < 0.  -> failwith "Probability of context-based policy was calculated less than 0."
+        | x when x >= 0.45 || x <= 0.55 -> Neutral
+        | x when x >= 0.55 -> WaitMore ((x - 0.55) / 3.)
+        | x when x <= 0.45 -> WaitLess ((0.45 - x) / 3.)
+        | _ -> failwith "never happens"
+
+module EvaluatorConfigs =
+    open QueueDataGenerator
+    open QueueFunctionGeneration
+    open Simulator
+
+    type private opts = QueueFunctionGeneration.Options
+
+    let igCoop = IgnoreCoopNetwork
+
+    let config_IFD_UA_N : opts =
+        (IgnoreFrequencyData, igCoop, defaultUnawareRandomNormalDepsCount)
+
+    let config_IFD_UA_U : opts =
+        (IgnoreFrequencyData, igCoop, defaultUnawareRandomUniformDepsCount)
+
+    let config_IFD_AW_N : opts =
+        (IgnoreFrequencyData, igCoop, defaultAwareRandomNormalDepsCount)
+
+    let config_IFD_AW_U : opts =
+        (IgnoreFrequencyData, igCoop, defaultAwareRandomUniformDepsCount)
+
+    let config_UFD_UA_N : opts =
+        (UseFrequencyData FrequenciesData.frequencies, igCoop, defaultUnawareRandomNormalDepsCount)
+
+    let config_UFD_UA_U : opts =
+        (UseFrequencyData FrequenciesData.frequencies, igCoop, defaultUnawareRandomUniformDepsCount)
+
+    let config_UFD_AW_N : opts =
+        (UseFrequencyData FrequenciesData.frequencies, igCoop, defaultAwareRandomNormalDepsCount)
+
+    let config_UFD_AW_U : opts =
+        (UseFrequencyData FrequenciesData.frequencies, igCoop, defaultAwareRandomUniformDepsCount)

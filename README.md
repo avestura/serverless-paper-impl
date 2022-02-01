@@ -25,9 +25,12 @@ My masters paper impl
   - [x] No-merge
   - [x] Random Wait
   - [x] Static Wait
-  - [ ] Dynamic Wait
+  - [x] Dynamic Wait
     - [x] Implement Co-op Network
     - [x] Implement Digestra
+    - [x] Policies
+      - [x] Always Neutral
+      - [x] Context Based
 - [ ] Evaluate scheduler metrics
   - [ ] Using Fully Random Synthetic Data
     - [ ] No-merge
@@ -42,7 +45,7 @@ My masters paper impl
 
 
 - Massure approaches by
-  - Response time
+  - Response time = Restoration Duration
   - Cost
   - Throughput
   - Response/Cost Ratio
@@ -65,9 +68,9 @@ Wait for 5 mins after function terminates
   - [x] Weight Evaporation
   - [x] Co-op probability calculator
 
-WarmContainer::Number of previous function runs to consider = 1
-Container::Number of reusing the container = k = 5
-Contaner::rMax = 20 min // can't wait more than 20 min
+- **WarmContainer**: Number of previous function runs to consider = 1
+- **Container**::Number of reusing the container = k = 5
+- **Contaner**::rMax = 20 min _// can't wait more than 20 min_
 
 #### Policy
 
@@ -81,8 +84,9 @@ Waiting container should consider these data:
 
 ## Statistical Distributions
 
-- Normalaizer: Weilbul
-- Number of Function dependencies: Normal, u = 50, stddev = 15
-- Function Duration: Chi-Square, v = 2.1
-- Function Run Request Every: Normal, u = 30, stddev = 10
-- Random Wait Scheduler Wait Time: Normal, u = 240, stddev = 50
+- Normalaizer: **Stretched Weilbul** with `a = 5`, `b = 2`
+- Number of Function dependencies: **Normal**, u = 50, stddev = 15
+- Function Duration: **Chi-Square**, `v = 2.1`
+- Function Run Request Every: **Normal**, `u = 30`, `stddev = 10`
+- Random Wait Scheduler Wait Time: **Normal**, `u = 240`, `stddev = 50`
+- Container Creation Time Cose: **Chi-squared**, `v = 5` 
