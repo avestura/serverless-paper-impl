@@ -10,6 +10,7 @@ open MathNet.Numerics
 open NodaTime
 open NodaTime
 open NodaTime
+open MathNet.Numerics.Statistics
 
 #r "nuget: FSharp.Data"
 #r "nuget: NodaTime"
@@ -380,7 +381,8 @@ with
     member this.concrete() =
         match this with
         | Concrete f -> f
-        | InferedFromCoopContext -> failwith "concerete serverelss function isn't available because this function is infered"
+        | InferedFromCoopContext ->
+            failwith "concerete serverelss function isn't available because this function is infered"
 
 
 type EnvironmentContext = {
@@ -735,6 +737,19 @@ type SimulatorContext = {
     functionsMergeStatuses: Map<uint, MergeStatus list>
 }
 
+type EvaluationMeasures = {
+    sum: Duration
+    avg: Duration
+    median: Duration
+}
+
+type SimulatorContextQoSMeasures = {
+    creation: EvaluationMeasures
+    working: EvaluationMeasures
+    waiting: EvaluationMeasures
+    restoration: EvaluationMeasures
+}
+
 [<RequireQualifiedAccess>]
 module SimulatorContext =
     open General
@@ -805,14 +820,44 @@ module SimulatorContext =
     let getContainers ctx =
         Map.values ctx.containers |> List.ofSeq
 
-    let getTotalTimes ctx =
-        let cnts = getContainers ctx
-        let creation = cnts |> List.sumBy (fun x -> x.creationDuration)
-        let working = cnts |> List.sumBy (fun x -> x.totalWorkingDuration)
-        let waiting = cnts |> List.sumBy (fun x -> x.totalWaitForNextFunctionDuration)
-        let restoration = cnts |> List.sumBy (fun x -> x.totalRestorationDuration)
+    open MathNet.Numerics.Statistics
 
-        (creation, working, waiting, restoration)
+    let getQoSMeassures ctx =
+        let cnts = getContainers ctx
+
+        let getTimeMeasureFor (timeSelector: Container -> Duration) =
+            let avg = cnts |> List.averageBy (fun x -> (timeSelector x).TotalNanoseconds) |> Duration.FromNanoseconds
+            let sum = cnts |> List.sumBy timeSelector
+            let median = cnts |> List.map (fun x -> (timeSelector x).TotalNanoseconds) |> Statistics.Median |> Duration.FromNanoseconds
+            (sum, avg, median)
+
+        let (creationSum, creationAvg, creationMedian) = getTimeMeasureFor (fun x -> x.creationDuration)
+        let (workingSum, workingAvg, workingMedian) = getTimeMeasureFor (fun x -> x.totalWorkingDuration)
+        let (waitingSum, waitingAvg, waitingMedian) = getTimeMeasureFor (fun x -> x.totalWaitForNextFunctionDuration)
+        let (restorationSum, restorationAvg, restorationMedian) = getTimeMeasureFor (fun x -> x.totalRestorationDuration)
+
+        {
+            creation = {
+                avg = creationAvg
+                sum = creationSum
+                median = creationMedian
+            }
+            working = {
+                avg = workingAvg
+                sum = workingSum
+                median = workingMedian
+            }
+            waiting = {
+                avg = waitingAvg
+                sum = waitingSum
+                median = waitingMedian
+            }
+            restoration = {
+                avg = restorationAvg
+                sum = restorationSum
+                median = restorationMedian
+            }
+        }
 
 
 type Scheduler = TimelineEvent -> SimulatorContext -> SimulatorContext
