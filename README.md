@@ -44,10 +44,11 @@ My masters paper impl
     - [ ] Dynamic Wait
 
 
-- Massure approaches by
+- Massure approaches for each container:
+  - utilization: total working / (working + creation + wait + restoration)
   - Response time = Restoration Duration
-  - Cost
-  - Throughput
+  - Turnaround time = creation + total of restoration duration
+  - Throughput = always same
   - Response/Cost Ratio
 
 #### No-Merge approach
@@ -90,3 +91,16 @@ Waiting container should consider these data:
 - Function Run Request Every: **Normal**, `u = 30`, `stddev = 10`
 - Random Wait Scheduler Wait Time: **Normal**, `u = 240`, `stddev = 50`
 - Container Creation Time Cose: **Chi-squared**, `v = 5` 
+
+## Simulation Runner Engine
+- schedulers
+  - noMerge
+  - staticWait
+  - randomWait
+  - dynamicWithAlwaysNeutralPolicy
+  - dynamicContextBased
+- configs:
+  - 8 different configs * numberOfFunctions * 5 different schedulers
+
+1. for each appraoch, meassure configs * number of functions
+2. for each scheduler, UFD_AW_N with increasing number of functions

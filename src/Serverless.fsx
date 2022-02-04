@@ -11,6 +11,8 @@ open NodaTime
 open NodaTime
 open NodaTime
 open MathNet.Numerics.Statistics
+open NodaTime
+open NodaTime
 
 #r "nuget: FSharp.Data"
 #r "nuget: NodaTime"
@@ -30,6 +32,7 @@ open System.Text.Json.Serialization
 [<Measure>] type kilobyte
 [<Measure>] type megabyte
 [<Measure>] type hour
+[<Measure>] type usd // united states dollars
 
 module General =
     open MathNet.Numerics.Distributions
@@ -587,6 +590,7 @@ module Container =
             mountKey = Guid.NewGuid()
         }
     let isDisposed cnt = cnt.disposed.IsSome
+    let lifetime cnt = match cnt.disposed with Some dt -> Some (dt - cnt.created) | None -> None
     let numberOfTimesUsed cnt = cnt.previousFunctions |> List.length
     let isWaitingForNextFunction cnt = cnt.finishedExecTime.IsSome && (isDisposed cnt|> not)
     let terminate disposeTime cnt =
@@ -737,17 +741,24 @@ type SimulatorContext = {
     functionsMergeStatuses: Map<uint, MergeStatus list>
 }
 
-type EvaluationMeasures = {
+type StatisticalEvaluationMeasures = {
     sum: Duration
     avg: Duration
     median: Duration
 }
 
-type SimulatorContextQoSMeasures = {
-    creation: EvaluationMeasures
-    working: EvaluationMeasures
-    waiting: EvaluationMeasures
-    restoration: EvaluationMeasures
+type SimulatorContextStatisticalMeasures = {
+    creation: StatisticalEvaluationMeasures
+    working: StatisticalEvaluationMeasures
+    waiting: StatisticalEvaluationMeasures
+    restoration: StatisticalEvaluationMeasures
+}
+
+type SumulatorContextQoSMeassures = {
+    utilization: float
+    responseTime: Duration
+    turnaroundTime: Duration
+    cost: float<usd>
 }
 
 [<RequireQualifiedAccess>]
@@ -822,7 +833,7 @@ module SimulatorContext =
 
     open MathNet.Numerics.Statistics
 
-    let getQoSMeassures ctx =
+    let getStatisticalMeassures ctx =
         let cnts = getContainers ctx
 
         let getTimeMeasureFor (timeSelector: Container -> Duration) =
@@ -859,6 +870,10 @@ module SimulatorContext =
             }
         }
 
+    let getQoSMeassures ctx =
+        let cnts = getContainers ctx
+
+        () // TODO
 
 type Scheduler = TimelineEvent -> SimulatorContext -> SimulatorContext
 
@@ -1276,3 +1291,26 @@ module EvaluatorConfigs =
 
     let config_UFD_AW_U : opts =
         (UseFrequencyData FrequenciesData.frequencies, igCoop, defaultAwareRandomUniformDepsCount)
+
+type SimulatorContextBatch = SimulatorContext list
+
+module SimulatorContextBatch =
+    let getBatchQoS ctx =
+        let qosList = ctx |> List.map (fun x -> x |> SimulatorContext.getStatisticalMeassures)
+
+        None
+
+
+module SimulationRunnerEngine =
+    open QueueDataGenerator
+    open QueueFunctionGeneration
+    open Simulator
+    open EvaluatorConfigs
+
+    let genQueue = generateFunctionQueueData
+    let runSim = runSimulatonWithQueueData "saturday"
+    let qosOf = SimulatorContext.getStatisticalMeassures
+    let functionCountSpan = [2..30]
+
+
+
