@@ -97,8 +97,8 @@ Waiting container should consider these data:
   - noMerge
   - staticWait
   - randomWait
-  - dynamicWithAlwaysNeutralPolicy
-  - dynamicContextBased
+  - dynamic :: AlwaysNeutral Policy
+  - dynamic:: ContextBased policy
 - configs:
   - 8 different configs * numberOfFunctions * 5 different schedulers
 

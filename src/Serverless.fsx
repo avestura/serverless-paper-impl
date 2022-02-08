@@ -13,6 +13,7 @@ open NodaTime
 open MathNet.Numerics.Statistics
 open NodaTime
 open NodaTime
+open Microsoft.FSharp.Reflection
 
 #r "nuget: FSharp.Data"
 #r "nuget: NodaTime"
@@ -56,6 +57,8 @@ module General =
 
     let ContainerCreationCostInSeconds_DefaultChiSquareFreedom = 5.0
 
+    let AmazonServerlessFunctionCost = 0.04<usd/hour>
+
     let inline weilbullStretched x a b = 1. - (Math.E ** (-1. * ((x/a) ** b)))
 
     /// Returns a number between 0. and 1.
@@ -86,6 +89,13 @@ module NodaTimeUtils =
         |> List.averageBy (fun x -> x.TotalSeconds)
         |> Duration.FromSeconds
 
+module Loggers =
+    let generalLogger filename =
+        (fun x -> File.AppendAllText (filename, x)), (fun x -> File.AppendAllText (filename, x + "\n"))
+
+    let dijkstraLogger content = generalLogger "dijkstra.txt"
+
+    let schedulerLogger = generalLogger "scheduler.txt"
 
 module DSExtensions =
     open General
@@ -151,14 +161,18 @@ module GraphExtensions =
     open System.Linq
 
     let printAdjMatrix (adj: uint[,]) =
-        printfn "--------------"
-        for x in 0 .. (Array2D.length1 adj - 1) do
-          printf "| "
-          for y in 0 .. (Array2D.length2 adj - 1) do
-            printf " %d |" adj.[x,y]
-          printfn "\n--------------"
+        let log, logn = Loggers.schedulerLogger
+        logn "--------------"
+        let len1 = Array2D.length1 adj
+        let len2 = Array2D.length2 adj
+        for x in 0 .. (len1 - 1) do
+          log "| "
+          for y in 0 .. (len2 - 1) do
+            log (sprintf " %d |" adj.[x,y])
+          logn "\n--------------"
 
     let dijkstra (nodes : uint32 seq) edges src dst = 
+        let log, logn = Loggers.schedulerLogger
         let src', dst' = src + 1u, dst  + 1u
         let g = new Graph<int, string>()
         let idMapper = new Dictionary<uint, uint>()
@@ -169,9 +183,19 @@ module GraphExtensions =
         for (n1, n2, w) in edges do
             let sourceId = idMapper[n1]
             let destinationId = idMapper[n2]
-            g.Connect(sourceId, destinationId, w, $"{n1} to {n2} with cost {w}") |> ignore
+            g.Connect(sourceId, destinationId, w, "") |> ignore
+        logn $"dijk {src}->{dst}, nodeCount: {g.NodesCount}, src edges:{g.EdgesCount(src')}, dst edges: {g.EdgesCount(dst')}"
+
         let result = g.Dijkstra(src', dst')
-        result.GetPath() |> Seq.toList |> List.map (fun x -> inversedIdMapper[x]), result.Distance
+        logn $"scheduler results done"
+        let path = result.GetPath().ToList()
+        logn $"path length = ${path.Count}"
+        let fsList = path |> List.ofSeq
+        logn (sprintf "fslist = %A" fsList)
+        let invMap = fsList |> List.map (fun x -> inversedIdMapper[x])
+        logn (sprintf "invmap = %A" fsList)
+        logn (sprintf "distance = %A" result.Distance)
+        invMap, result.Distance
 
 module PaperDataUtils = 
     let convertJsonValue (converter: JsonValue -> 'a) (props: ('b * JsonValue) array) =
@@ -374,7 +398,7 @@ module ServerlessFunction =
             let od2 = orderedDeps f2
             let intersect =
                 (Seq.ofList od1).Intersect(od2)
-                |> Seq.take FunctionSimilarity_TopNCommonDependencies
+                |> Seq.truncate FunctionSimilarity_TopNCommonDependencies
                 |> Seq.sumBy (fun x -> x.install.bytes)
 
             normalize intersect
@@ -570,6 +594,13 @@ type Container = {
     mountKey: Guid // A key to keep track of changes in the container status of being occupied by different functions
 }
 
+type ContainerQoSMeassures = {
+    utilization: float
+    responseTime: Duration
+    turnaroundTime: Duration
+    cost: float<usd>
+}
+
 [<RequireQualifiedAccess>]
 module Container =
     let makeNew name id func created =
@@ -604,17 +635,40 @@ module Container =
         }
     let finishExec finishTime cnt =
         { cnt with finishedExecTime = Some finishTime; mountKey = Guid.NewGuid() }
-
+    let numberOfFunctionsInContainer cnt =
+        (cnt.previousFunctions |> List.length) + (match cnt.runningFunction with None -> 0 | Some _ -> 1)
     let randomCreationDuration () =
         General.rnd
         |> Sample.chiSquared General.ContainerCreationCostInSeconds_DefaultChiSquareFreedom
         |> Duration.FromSeconds
+
+    let getQosMeassures cnt =
+        match lifetime cnt with
+        | None -> None
+        | Some d ->
+            let fc = numberOfFunctionsInContainer cnt |> float
+            let two, twa, tre, tcr = cnt.totalWorkingDuration, cnt.totalWaitForNextFunctionDuration, cnt.totalRestorationDuration, cnt.creationDuration
+            let utilization = (two/(two + twa + tre + tcr))
+            let responseTime = cnt.totalRestorationDuration / fc
+            let turnaroundTime = (tcr + (tre * fc)) / fc
+            let cost = (d.ToDuration().TotalHours * 1.<hour>) * General.AmazonServerlessFunctionCost
+
+            Some {
+                utilization = utilization
+                responseTime = responseTime
+                turnaroundTime = turnaroundTime
+                cost = cost
+            }
 
 type TimelineEventKind =
     | QueueRequest of QueueFunctionRequest // A new function wants to run in the serverless platform
     | FinishRunningFunction of Container // A function finished its execution in container
     | MountWaitTimedOut of Container * mountKey: Guid // Container waited some time epoch for another function to join but nothing happened
     | EvaporateCoopNetEdges
+    | FinalizeSimulation
+    member x.GetName() = 
+        match FSharpValue.GetUnionFields(x, x.GetType()) with
+        | (case, _) -> case.Name  
 
 [<CustomComparison;CustomEquality>]
 type TimelineEvent = {
@@ -667,7 +721,7 @@ module DependencyGraph =
     let evaporate graph =
         let newArray =
             graph.adjMatrix
-            |> Array2D.map (fun x -> max 0u (x - 1u))
+            |> Array2D.map (fun x -> if x = 0u then 0u else (x - 1u))
             
         { graph with adjMatrix = newArray }
 
@@ -717,6 +771,7 @@ module DependencyGraph =
         path, weights, distance
 
     let coopScore f1Id f2Id graph =
+        let log, logn = Loggers.schedulerLogger
         let rec score p edgeWeights =
             match edgeWeights with
             | [] -> p
@@ -724,7 +779,9 @@ module DependencyGraph =
                 let newP = p * (float currentEdge |> General.normalize)
                 score newP restEdges
 
+        logn $"dij {f1Id}->{f2Id}/start"
         let path, distance = graph |> dijkestraPath f1Id f2Id
+        logn $"dij {f1Id}->{f2Id}/done"
         let weights = graph |> edgeWeightsFromPath path
 
         match weights with [] -> 0. | xs -> score 1. xs
@@ -739,6 +796,7 @@ type SimulatorContext = {
     containers: Map<string, Container>
     dependencyGraph: DependencyGraph
     functionsMergeStatuses: Map<uint, MergeStatus list>
+    finalizeReached: bool
 }
 
 type StatisticalEvaluationMeasures = {
@@ -752,13 +810,6 @@ type SimulatorContextStatisticalMeasures = {
     working: StatisticalEvaluationMeasures
     waiting: StatisticalEvaluationMeasures
     restoration: StatisticalEvaluationMeasures
-}
-
-type SumulatorContextQoSMeassures = {
-    utilization: float
-    responseTime: Duration
-    turnaroundTime: Duration
-    cost: float<usd>
 }
 
 [<RequireQualifiedAccess>]
@@ -821,9 +872,10 @@ module SimulatorContext =
     let functionMergeSuccessRate functionId ctx =
         let statuses = ctx.functionsMergeStatuses[functionId]
         let success = statuses |> List.filter (fun (k, _) -> k = SuccessfulMerge) |> List.length |> float
-        let total = statuses |> List.length |> float
-        
-        success / total
+        let total = statuses |> List.length
+
+        if total = 0 then 0.5
+        else (success / float total)
 
     let coopScore fSourceId fDestId ctx =
         ctx.dependencyGraph|> DependencyGraph.coopScore fSourceId fDestId
@@ -870,10 +922,16 @@ module SimulatorContext =
             }
         }
 
-    let getQoSMeassures ctx =
+    let getQoSMeassuresList ctx =
         let cnts = getContainers ctx
 
-        () // TODO
+        cnts
+        |> List.map (Container.getQosMeassures)
+        |> List.filter Option.isSome
+        |> List.map Option.get
+            
+
+
 
 type Scheduler = TimelineEvent -> SimulatorContext -> SimulatorContext
 
@@ -882,7 +940,10 @@ module Simulator =
     let insertEvent = TimelineEvent.insertEvent
     let rec runSimulation (scheduler: Scheduler) (context: SimulatorContext) =
         match context.events with
-        | [] -> context
+        | [] ->
+            let _, logn = Loggers.schedulerLogger
+            logn "Simulation Finished"
+            context
         | event::restEvents -> 
             let popEventContext = { context with events = restEvents }
             let newContext = scheduler event popEventContext
@@ -892,10 +953,12 @@ module Simulator =
         let funcLen = uint queueFuncReqBatch.funcs.Length
         {
             day = day
+            finalizeReached = false
             events =
                 queueFuncReqBatch.requests
                 |> List.map (fun qfr -> { time = qfr.startTime ; kind = QueueRequest qfr })
                 |> insertEvent ({ time = LocalTime(0,0,0) ; kind = EvaporateCoopNetEdges })
+                |> insertEvent ({ time = LocalTime(23,50,0); kind = FinalizeSimulation })
             containerIdCounter = 0u
             containers = Map.empty
             dependencyGraph = DependencyGraph.init funcLen
@@ -950,6 +1013,7 @@ module BasicSchedulers =
             let terminatedContainer = container |> Container.terminate ev.time
             let newConts = ctx.containers |> Map.add container.name terminatedContainer
             { ctx with containers = newConts }
+        | FinalizeSimulation -> { ctx with finalizeReached = true }
         | _ -> ctx
 
     let computedWaitScheduler (getWaitTime: unit -> int<second>): Scheduler = fun ev ctx ->
@@ -1039,6 +1103,7 @@ module BasicSchedulers =
             else
                 ctx
         | EvaporateCoopNetEdges -> ctx
+        | FinalizeSimulation -> { ctx with finalizeReached = true }
 
     let staticWaitScheduler (waitTime: int<second>): Scheduler =
         computedWaitScheduler (fun () -> waitTime)
@@ -1073,6 +1138,11 @@ module ComplexSchedulers =
 
     let dynamicWaitScheduler (policy: RLPolicy) (config: DynamicSchedulerConfiguration option): Scheduler = fun ev originalContext ->
         let (time, kind) = ev.time, ev.kind
+        let log, logn = Loggers.schedulerLogger
+        logn $"handling {time}: {kind.GetName()}"
+        originalContext.dependencyGraph.adjMatrix |> GraphExtensions.printAdjMatrix
+        
+        
         let ctx = originalContext |> SimulatorContext.purgeOldMergeStatuses time
         let conf = match config with Some c -> c | None -> defaultDynamicSchedulerConfig
         match kind with
@@ -1149,16 +1219,22 @@ module ComplexSchedulers =
                     finishedExecTime = Some time
                     mountKey = newKey
             }
+            let newEvents =
+                if ctx.finalizeReached then
+                    ctx.events
+                else
+                    ctx.events |> insertEvent {
+                        time = nextEventTime
+                        kind = MountWaitTimedOut (newCont, newKey)
+                    }
+
             { ctx with
                 containers = ctx.containers |> Map.add newCont.name newCont
-                events = ctx.events |> insertEvent {
-                    time = nextEventTime
-                    kind = MountWaitTimedOut (newCont, newKey)
-                }
+                events = newEvents
             }
         | MountWaitTimedOut (cont, key) ->
             let targetCont = ctx.containers.[cont.name]
-            if key <> targetCont.mountKey then ctx
+            if ctx.finalizeReached || key <> targetCont.mountKey then ctx
             else
                 let action = policy ctx targetCont
                 let newMaxWaitChance = max 0. (cont.chanceOfWaitingMoreMaximumValue - conf.maxWaitChanceCost)
@@ -1215,15 +1291,24 @@ module ComplexSchedulers =
                     
 
         | EvaporateCoopNetEdges ->
-            let newEvaporateEvent = { time = time.PlusMinutes(1); kind = EvaporateCoopNetEdges }
-            { ctx with 
-                dependencyGraph = DependencyGraph.evaporate ctx.dependencyGraph
-                events = ctx.events |> insertEvent newEvaporateEvent
-            }
+            if ctx.finalizeReached then ctx
+            else
+                let newEvaporateEvent = { time = time.PlusMinutes(5); kind = EvaporateCoopNetEdges }
+                { ctx with 
+                    dependencyGraph = DependencyGraph.evaporate ctx.dependencyGraph
+                    events = ctx.events |> insertEvent newEvaporateEvent
+                }
+        | FinalizeSimulation ->
+            //let cleansedEvents = ctx.events |> List.filter (fun x -> match x.kind with FinishRunningFunction c -> true | _ -> false)
+            { ctx with finalizeReached = true }
+
 module ProbabilityUtils =
     let unionOfIndependentEvents probs =
-        let inversedProbs = probs |> List.map (fun x -> 1. - x)
-        1. - (List.reduce (*) probs)
+        match probs with
+        | [] -> 0.
+        | probs ->
+            let inversedProbs = probs |> List.map (fun x -> 1. - x)
+            1. - (List.reduce (*) probs)
 
 module DynamicSchedulerPolicies =
     open ComplexSchedulers
@@ -1235,17 +1320,19 @@ module DynamicSchedulerPolicies =
     let contextBasedPolicy : RLPolicy = fun ctx cont ->
         let rf = cont.runningFunction.Value // running function
         let prevSuccessRate = ctx |> SimulatorContext.functionMergeSuccessRate (rf.id) // probability
+        //Console.WriteLine "before coop"
         let coopWithRunningFunctionsProbability = // probability
             ctx
             |> SimulatorContext.getRunningFunctions
             |> List.map (fun fSource -> ctx |> SimulatorContext.coopScore fSource.id rf.id) // array of probabilities
             |> ProbabilityUtils.unionOfIndependentEvents
-
+        
         let similarityScoreProb = // probability
             ctx
             |> SimulatorContext.getRunningFunctions
             |> List.map (fun fSource -> ServerlessFunction.similarity fSource rf) // array of probs
             |> ProbabilityUtils.unionOfIndependentEvents
+
 
         let prob =
             [ prevSuccessRate; coopWithRunningFunctionsProbability; similarityScoreProb ]
@@ -1257,7 +1344,19 @@ module DynamicSchedulerPolicies =
         | x when x >= 0.45 || x <= 0.55 -> Neutral
         | x when x >= 0.55 -> WaitMore ((x - 0.55) / 3.)
         | x when x <= 0.45 -> WaitLess ((0.45 - x) / 3.)
-        | _ -> failwith "never happens"
+        | x ->
+            printfn $"prev success rate: {prevSuccessRate}"
+            printfn $"coopWithRunningFunctionsProbability: {coopWithRunningFunctionsProbability}"
+            printfn $"similarityScoreProb: {similarityScoreProb}"
+            failwith $"never happens: probability can't be {x}"
+
+
+module AllSchedulers =
+    let noMergeScheduler = BasicSchedulers.noMergeScheduler
+    let static5MinWaitScheduler = BasicSchedulers.staticWaitScheduler 300<second>
+    let random240_50MeanWaitScheduler = BasicSchedulers.randomWaitScheduler 240<second> 50<second>
+    let dynamicNeutralScheduler = ComplexSchedulers.dynamicWaitScheduler DynamicSchedulerPolicies.alwaysNeturalPolicy None
+    let dynamicContextScheduler = ComplexSchedulers.dynamicWaitScheduler DynamicSchedulerPolicies.contextBasedPolicy None
 
 module EvaluatorConfigs =
     open QueueDataGenerator
@@ -1294,12 +1393,45 @@ module EvaluatorConfigs =
 
 type SimulatorContextBatch = SimulatorContext list
 
+type SimulatorContextBatchQoS = {
+    utilization: float * float
+    responseTime: float<second> * float<second>
+    turnaroundTime: float<second> * float<second>
+    cost: float<usd> * float<usd>
+}
+
+[<RequireQualifiedAccess>]
+module SimulatorContextBatchQoS =
+    let print scbqos =
+        let um, us = scbqos.utilization
+        printfn $"Util: {um * 100.}%%, stddev: {us * 100.}%%"
+        let rm, rs = scbqos.responseTime
+        printfn $"Util: {rm}s, stddev: {rs}s"
+        let tm, ts = scbqos.turnaroundTime
+        printfn $"Util: {tm}s, stddev: {ts}s"
+        let cm, cs = scbqos.cost
+        printfn $"Util: ${cm}, stddev: ${us}"
+
 module SimulatorContextBatch =
-    let getBatchQoS ctx =
-        let qosList = ctx |> List.map (fun x -> x |> SimulatorContext.getStatisticalMeassures)
+    
+    let getBatchQoS ctxs =
+        let ctxCount = ctxs |> List.length
+        let qosListPerCtx = ctxs |> List.map (fun x -> x |> SimulatorContext.getQoSMeassuresList)
+        let costs = qosListPerCtx |> List.map (fun x -> x |> List.sumBy (fun x -> x.cost))
+        
+        let qosCollected = qosListPerCtx |> List.collect id
 
-        None
+        let (uMean, uStddev) = qosCollected |> List.map (fun x -> x.utilization) |> Statistics.MeanStandardDeviation
+        let (rMean, rStddev) = qosCollected |> List.map (fun x -> x.responseTime.TotalSeconds) |> Statistics.MeanStandardDeviation |> (fun (a, b) -> a * 1.<second> , b * 1.<second>)
+        let (tMean, tStddev) = qosCollected |> List.map (fun x -> x.turnaroundTime.TotalSeconds) |> Statistics.MeanStandardDeviation |> (fun (a, b) -> a * 1.<second> , b * 1.<second>)
+        let (costMean, costStddev) = costs |> List.map float |> Statistics.MeanStandardDeviation |> (fun (a, b) -> a * 1.<usd> , b * 1.<usd>)
 
+        {
+            utilization = uMean, uStddev
+            responseTime = rMean, rStddev
+            turnaroundTime = tMean, tStddev
+            cost = costMean, costStddev
+        }
 
 module SimulationRunnerEngine =
     open QueueDataGenerator
@@ -1309,8 +1441,15 @@ module SimulationRunnerEngine =
 
     let genQueue = generateFunctionQueueData
     let runSim = runSimulatonWithQueueData "saturday"
-    let qosOf = SimulatorContext.getStatisticalMeassures
+    let runBatch (iteration: int) queueRequests scheduler =
+        let rec run iterId contextList =
+            match iterId with
+            | x when x = iteration -> contextList
+            | y ->
+                let newContextList = contextList@[runSim queueRequests scheduler]
+                run (iterId + 1) newContextList
+
+        run 1 []
+    let qosOf = SimulatorContextBatch.getBatchQoS
     let functionCountSpan = [2..30]
-
-
 
