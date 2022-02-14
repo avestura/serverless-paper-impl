@@ -29,15 +29,21 @@ open Microsoft.FSharp.Data.UnitSystems.SI.UnitNames
 open System.Text.Json
 open System.Text.Json.Serialization
 
+
+
 [<Measure>] type dbyte
 [<Measure>] type kilobyte
 [<Measure>] type megabyte
+[<Measure>] type minute
 [<Measure>] type hour
 [<Measure>] type usd // united states dollars
 
 module General =
     open MathNet.Numerics.Distributions
     let rnd = Random()
+
+    [<Literal>]
+    let ENABLE_LOG = false
 
     let NumberOfFunctionDeps_DefaultNormalDistMean = 50
     let NumberOfFunctionDeps_DefaultNormalDistStdDev = 15
@@ -51,13 +57,15 @@ module General =
     
     let FunctionSimilarity_TopNCommonDependencies = 10
 
-    let PackageRestoreSpeed = 2.<second/megabyte>
+    let PackageRestoreSpeed = 0.05<second/megabyte>
 
     let PurgeMergeStatusesBeforeInHours = 1.<hour>
 
     let ContainerCreationCostInSeconds_DefaultChiSquareFreedom = 5.0
 
     let AmazonServerlessFunctionCost = 0.04<usd/hour>
+
+    let DefaultEvaporationInterval = 5<minute>
 
     let inline weilbullStretched x a b = 1. - (Math.E ** (-1. * ((x/a) ** b)))
 
@@ -91,9 +99,12 @@ module NodaTimeUtils =
 
 module Loggers =
     let generalLogger filename =
-        (fun x -> File.AppendAllText (filename, x)), (fun x -> File.AppendAllText (filename, x + "\n"))
+        let log = fun x -> if General.ENABLE_LOG then File.AppendAllText (filename, x) else ()
+        let logn = fun x -> if General.ENABLE_LOG then File.AppendAllText (filename, x + "\n") else ()
+        
+        log, logn
 
-    let dijkstraLogger content = generalLogger "dijkstra.txt"
+    let dijkstraLogger = generalLogger "dijkstra.txt"
 
     let schedulerLogger = generalLogger "scheduler.txt"
 
@@ -648,7 +659,7 @@ module Container =
         | Some d ->
             let fc = numberOfFunctionsInContainer cnt |> float
             let two, twa, tre, tcr = cnt.totalWorkingDuration, cnt.totalWaitForNextFunctionDuration, cnt.totalRestorationDuration, cnt.creationDuration
-            let utilization = (two/(two + twa + tre + tcr))
+            let utilization = (two/(two + twa + tre + tcr)) * 100.
             let responseTime = cnt.totalRestorationDuration / fc
             let turnaroundTime = (tcr + (tre * fc)) / fc
             let cost = (d.ToDuration().TotalHours * 1.<hour>) * General.AmazonServerlessFunctionCost
@@ -1293,7 +1304,7 @@ module ComplexSchedulers =
         | EvaporateCoopNetEdges ->
             if ctx.finalizeReached then ctx
             else
-                let newEvaporateEvent = { time = time.PlusMinutes(5); kind = EvaporateCoopNetEdges }
+                let newEvaporateEvent = { time = time.PlusMinutes(int General.DefaultEvaporationInterval); kind = EvaporateCoopNetEdges }
                 { ctx with 
                     dependencyGraph = DependencyGraph.evaporate ctx.dependencyGraph
                     events = ctx.events |> insertEvent newEvaporateEvent
@@ -1406,11 +1417,27 @@ module SimulatorContextBatchQoS =
         let um, us = scbqos.utilization
         printfn $"Util: {um * 100.}%%, stddev: {us * 100.}%%"
         let rm, rs = scbqos.responseTime
-        printfn $"Util: {rm}s, stddev: {rs}s"
+        printfn $"Response Time: {rm}s, stddev: {rs}s"
         let tm, ts = scbqos.turnaroundTime
-        printfn $"Util: {tm}s, stddev: {ts}s"
+        printfn $"Turnaround Time: {tm}s, stddev: {ts}s"
         let cm, cs = scbqos.cost
-        printfn $"Util: ${cm}, stddev: ${us}"
+        printfn $"Cost: ${cm}, stddev: ${us}"
+
+    let utilizationChartData scbqos =
+        let m, s = scbqos.utilization
+        [ for x in 0. ..0.1.. 100 -> (x, Normal.PDF(m, s, x)) ]
+
+    let responseTimeChartData scbqos =
+        let m, s = scbqos.responseTime
+        [ for x in 0. ..0.1.. 100 -> (x, Normal.PDF(float m, float s, x)) ]
+
+    let turnaroundTimeChartData scbqos =
+        let m, s = scbqos.turnaroundTime
+        [ for x in 0. ..0.1.. 100. -> (x, Normal.PDF(float m, float s, x)) ]
+
+    let costChartData scbqos =
+        let m, s = scbqos.cost
+        [ for x in 0. .. 0.01 .. 4. -> (x, Normal.PDF(float m, float s, x)) ]
 
 module SimulatorContextBatch =
     

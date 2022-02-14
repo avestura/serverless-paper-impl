@@ -31,17 +31,17 @@ My masters paper impl
     - [x] Policies
       - [x] Always Neutral
       - [x] Context Based
-- [ ] Evaluate scheduler metrics
-  - [ ] Using Fully Random Synthetic Data
-    - [ ] No-merge
-    - [ ] Random Wait
-    - [ ] Static Wait
-    - [ ] Dynamic Wait
-  - [ ] Using Realistic Synthetic Data
-    - [ ] No-merge
-    - [ ] Random Wait
-    - [ ] Static Wait
-    - [ ] Dynamic Wait
+- [x] Evaluate scheduler metrics
+  - [x] Using Fully Random Synthetic Data
+    - [x] No-merge
+    - [x] Random Wait
+    - [x] Static Wait
+    - [x] Dynamic Wait
+  - [x] Using Realistic Synthetic Data
+    - [x] No-merge
+    - [x] Random Wait
+    - [x] Static Wait
+    - [x] Dynamic Wait
 
 
 - Massure approaches for each container:
@@ -97,8 +97,8 @@ Waiting container should consider these data:
   - noMerge
   - staticWait
   - randomWait
-  - dynamic :: AlwaysNeutral Policy
-  - dynamic:: ContextBased policy
+  - dynamic :: AlwaysNeutral policy
+  - dynamic :: ContextBased policy
 - configs:
   - 8 different configs * numberOfFunctions * 5 different schedulers
 
