@@ -660,8 +660,8 @@ module Container =
             let fc = numberOfFunctionsInContainer cnt |> float
             let two, twa, tre, tcr = cnt.totalWorkingDuration, cnt.totalWaitForNextFunctionDuration, cnt.totalRestorationDuration, cnt.creationDuration
             let utilization = (two/(two + twa + tre + tcr)) * 100.
-            let responseTime = cnt.totalRestorationDuration / fc
-            let turnaroundTime = (tcr + (tre * fc)) / fc
+            let responseTime = (tcr + (tre * fc)) / fc
+            let turnaroundTime = (tcr + ((tre + two) * fc)) / fc
             let cost = (d.ToDuration().TotalHours * 1.<hour>) * General.AmazonServerlessFunctionCost
 
             Some {
@@ -1429,7 +1429,7 @@ module SimulatorContextBatchQoS =
 
     let responseTimeChartData scbqos =
         let m, s = scbqos.responseTime
-        [ for x in 0. ..0.1.. 100 -> (x, Normal.PDF(float m, float s, x)) ]
+        [ for x in 0. ..0.1.. 200. -> (x, Normal.PDF(float m, float s, x)) ]
 
     let turnaroundTimeChartData scbqos =
         let m, s = scbqos.turnaroundTime
@@ -1478,5 +1478,12 @@ module SimulationRunnerEngine =
 
         run 1 []
     let qosOf = SimulatorContextBatch.getBatchQoS
+    let forAllSchedulers (doForScheduler: Scheduler -> 'a) =
+        doForScheduler AllSchedulers.noMergeScheduler,
+        doForScheduler AllSchedulers.static5MinWaitScheduler,
+        doForScheduler AllSchedulers.random240_50MeanWaitScheduler,
+        doForScheduler AllSchedulers.dynamicNeutralScheduler,
+        doForScheduler AllSchedulers.dynamicContextScheduler
+
     let functionCountSpan = [2..30]
 
