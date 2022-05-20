@@ -1,5 +1,13 @@
 namespace Avestura.Serverless
 
+open System.Collections.Generic
+
+#r "nuget: FSharp.Data"
+#r "nuget: NodaTime"
+#r "nuget: MathNet.Numerics"
+#r "nuget: MathNet.Numerics.FSharp"
+#r "nuget: Dijkstra.NET"
+
 open NodaTime
 open System.Text.Json
 open System.Text.Json.Serialization
@@ -14,13 +22,6 @@ open MathNet.Numerics.Statistics
 open NodaTime
 open NodaTime
 open Microsoft.FSharp.Reflection
-
-#r "nuget: FSharp.Data"
-#r "nuget: NodaTime"
-#r "nuget: MathNet.Numerics"
-#r "nuget: MathNet.Numerics.FSharp"
-#r "nuget: Dijkstra.NET"
-
 open System
 open System.IO
 open System.Text.Json
@@ -57,13 +58,13 @@ module General =
     
     let FunctionSimilarity_TopNCommonDependencies = 10
 
-    let PackageRestoreSpeed = 0.05<second/megabyte>
+    let PackageRestoreSpeed = 0.1<second/megabyte>
 
     let PurgeMergeStatusesBeforeInHours = 1.<hour>
 
     let ContainerCreationCostInSeconds_DefaultChiSquareFreedom = 5.0
 
-    let AmazonServerlessFunctionCost = 0.04<usd/hour>
+    let AmazonServerlessFunctionCost = 0.06<usd/hour>
 
     let DefaultEvaporationInterval = 5<minute>
 
@@ -373,13 +374,16 @@ module ServerlessFunction =
         |> List.sum
         |> (*) 1<dbyte>
 
-    let getNonCachedDependencySize (cachedFunc: ServerlessFunction) currentFunction =
-        let notCachedDeps = DSExtensions.listSubtract currentFunction.deps cachedFunc.deps
+    let getDepsListNonCachedDependencySize (cachedFuncDeps: string list) (currentFunctionDeps: string list) =
+        let notCachedDeps = DSExtensions.listSubtract currentFunctionDeps cachedFuncDeps
         notCachedDeps
         |> List.map PackagesData.getFullPackageDataSafe 
         |> List.map (fun x -> x.install.bytes)
         |> List.sum
         |> (*) 1<dbyte>
+
+    let getNonCachedDependencySize (cachedFunc: ServerlessFunction) currentFunction =
+        getDepsListNonCachedDependencySize cachedFunc.deps currentFunction.deps
 
     let fullRestorationDuration func = 
         getFullDependencySize func
@@ -387,12 +391,15 @@ module ServerlessFunction =
         |> (*) 1.0<dbyte>
         |> General.calculateRestorationDuration
 
-    let nonCachedRestorationDuration (cachedFunc: ServerlessFunction) currentFunction =
-        currentFunction
-        |> getNonCachedDependencySize cachedFunc
+    let nonCachedDepsListRestorationDuration (cachedFuncDepsList: string list) currentFunctionDepsList =
+        currentFunctionDepsList
+        |> getDepsListNonCachedDependencySize cachedFuncDepsList
         |> float
         |> (*) 1.0<dbyte>
         |> General.calculateRestorationDuration
+
+    let nonCachedRestorationDuration (cachedFunc: ServerlessFunction) currentFunction =
+        nonCachedDepsListRestorationDuration cachedFunc.deps currentFunction.deps
 
     open PackagesData
     open System.Linq
@@ -561,7 +568,8 @@ module QueueDataGenerator =
 
     let generateFunctionQueueData (options: QueueFunctionGeneration.Options) numberOfFunctions = 
         let terminationCondition (prevTime: LocalTime) (newTime: LocalTime) =
-            prevTime.Hour = 23 && newTime.Hour = 0
+            // prevTime.Hour = 23 && newTime.Hour = 0
+            ((LocalTime(23,40,0) - newTime).ToDuration().TotalNanoseconds <= 0.)
 
         let (freqMode, coopMode, depencencyMode) = options
 
@@ -660,9 +668,12 @@ module Container =
             let fc = numberOfFunctionsInContainer cnt |> float
             let two, twa, tre, tcr = cnt.totalWorkingDuration, cnt.totalWaitForNextFunctionDuration, cnt.totalRestorationDuration, cnt.creationDuration
             let utilization = (two/(two + twa + tre + tcr)) * 100.
-            let responseTime = (tcr + (tre * fc)) / fc
-            let turnaroundTime = (tcr + ((tre + two) * fc)) / fc
-            let cost = (d.ToDuration().TotalHours * 1.<hour>) * General.AmazonServerlessFunctionCost
+            let responseTime = (tcr + tre) / fc
+            let turnaroundTime = (tcr + tre + two) / fc
+            let totalHoursRaw = d.ToDuration().TotalHours
+            let totalHours = if totalHoursRaw <= 0. then 24. + totalHoursRaw else totalHoursRaw
+            if totalHours <= 0. then failwith $"total hours was: {totalHours}, created: {cnt.created}, disposed: {cnt.disposed.Value}"
+            let cost = (totalHours * 1.<hour>) * General.AmazonServerlessFunctionCost
 
             Some {
                 utilization = utilization
@@ -831,6 +842,12 @@ module SimulatorContext =
         |> List.ofSeq
         |> List.filter Container.isWaitingForNextFunction
 
+    let getContainerByName name ctx =
+        ctx.containers.TryFind name
+
+    let containerExists name ctx =
+        ctx.containers.ContainsKey name
+
     let getRunningFunctions ctx =
         ctx.containers.Values
         |> List.ofSeq
@@ -969,7 +986,7 @@ module Simulator =
                 queueFuncReqBatch.requests
                 |> List.map (fun qfr -> { time = qfr.startTime ; kind = QueueRequest qfr })
                 |> insertEvent ({ time = LocalTime(0,0,0) ; kind = EvaporateCoopNetEdges })
-                |> insertEvent ({ time = LocalTime(23,50,0); kind = FinalizeSimulation })
+                |> insertEvent ({ time = LocalTime(23,40,0); kind = FinalizeSimulation })
             containerIdCounter = 0u
             containers = Map.empty
             dependencyGraph = DependencyGraph.init funcLen
@@ -1313,13 +1330,131 @@ module ComplexSchedulers =
             //let cleansedEvents = ctx.events |> List.filter (fun x -> match x.kind with FinishRunningFunction c -> true | _ -> false)
             { ctx with finalizeReached = true }
 
+module SandScheduler =
+    open General
+    open Simulator
+
+    // In SAND scheduler the type `Container actually means a process inside a container
+
+    type SchedulerData = {
+        funcToAppIdMapper: uint -> uint
+        appFunctionCache: uint -> string list
+        cacheFunctionForContainer: uint -> string list -> unit
+    }
+
+    let defaultSchedulerDataStorage () =
+        let FUNCTION_PER_APP = 3u
+        let cache = Dictionary<uint, HashSet<string>>()
+
+        {
+            funcToAppIdMapper = fun fId -> fId / FUNCTION_PER_APP
+            appFunctionCache = fun appId -> cache[appId] |> List.ofSeq
+            cacheFunctionForContainer = fun appId deps -> 
+                if cache.ContainsKey appId then
+                    for dep in deps do cache[appId].Add(dep) |> ignore
+                else
+                    cache.Add(appId, HashSet(deps))
+        }
+
+    // groups functions to some apps, then isolate apps and run same-app functions together
+    let genericSandScheduler (getSchedulerData: unit -> SchedulerData): Scheduler = fun ev ctx ->
+        let (time, kind) = ev.time, ev.kind
+        let schdata = getSchedulerData()
+        match kind with
+        | QueueRequest qfr ->
+            let f = qfr.concreteFunc()
+            let appId = schdata.funcToAppIdMapper f.id
+            let mountConts = ctx |> SimulatorContext.getContainerByName $"app-{appId}"
+            match mountConts with
+            | None ->
+                let restoreDuration =  ServerlessFunction.fullRestorationDuration f
+                schdata.cacheFunctionForContainer appId f.deps
+                let containerCreationDuration = Container.randomCreationDuration()
+                let lifetimeDuration = containerCreationDuration + restoreDuration + qfr.serviceTime
+                let functionFinish = time.PlusNanoseconds(lifetimeDuration.ToInt64Nanoseconds())
+                let newProcess = {
+                    name = $"app-%d{appId}"
+                    id = ctx.containerIdCounter
+                    runningFunction = Some f
+                    created = time
+                    creationDuration = containerCreationDuration
+                    finishedExecTime = None
+                    disposed = None
+                    totalRestorationDuration = restoreDuration
+                    totalWaitForNextFunctionDuration = Duration.Zero
+                    totalWorkingDuration = qfr.serviceTime
+                    chanceOfWaitingMore = 0.0
+                    chanceOfWaitingMoreMaximumValue = 1.0
+                    previousFunctions = []
+                    mountKey = Guid.NewGuid()
+                }
+                { ctx with
+                    containerIdCounter = ctx.containerIdCounter + 1u
+                    containers = ctx.containers |> Map.add newProcess.name newProcess
+                    events = ctx.events |> insertEvent {
+                        time = functionFinish
+                        kind = FinishRunningFunction newProcess
+                    }
+                }
+            | Some host ->
+                let restorationTime = f.deps |> ServerlessFunction.nonCachedDepsListRestorationDuration (schdata.appFunctionCache appId)
+                schdata.cacheFunctionForContainer appId f.deps
+                let lifetimeDuration = restorationTime + qfr.serviceTime
+                let functionFinish = time.PlusNanoseconds(lifetimeDuration.ToInt64Nanoseconds())
+                let newProcess = {
+                    name = $"app-%d{appId}"
+                    id = ctx.containerIdCounter
+                    runningFunction = Some f
+                    created = time
+                    creationDuration = Duration.Zero
+                    finishedExecTime = None
+                    disposed = None
+                    totalRestorationDuration = restorationTime
+                    totalWaitForNextFunctionDuration = Duration.Zero
+                    totalWorkingDuration = qfr.serviceTime
+                    chanceOfWaitingMore = 0.0
+                    chanceOfWaitingMoreMaximumValue = 1.0
+                    previousFunctions = []
+                    mountKey = Guid.NewGuid()
+                }
+                { ctx with
+                    containerIdCounter = ctx.containerIdCounter + 1u
+                    containers = ctx.containers |> Map.add newProcess.name newProcess
+                    events = ctx.events |> insertEvent {
+                        time = functionFinish
+                        kind = FinishRunningFunction newProcess
+                    }
+                }
+
+
+        | FinishRunningFunction cont ->
+            let newKey = Guid.NewGuid()
+            let newCont = {
+                cont with
+                    finishedExecTime = Some time
+                    mountKey = newKey
+            }
+            { ctx with
+                containers = ctx.containers |> Map.add newCont.name newCont
+            }
+        | FinalizeSimulation -> { ctx with finalizeReached = true }
+        | _ -> ctx
+
+    let defaultSandScheduler = genericSandScheduler defaultSchedulerDataStorage
+
+module BeyondLBScheduler =
+    // biggest package on machine
+    // consistent hashing
+    // power of two choices
+    let beyondLoadBalancingScheduler : Scheduler = fun ev ctx -> ctx
+
 module ProbabilityUtils =
     let unionOfIndependentEvents probs =
         match probs with
         | [] -> 0.
         | probs ->
             let inversedProbs = probs |> List.map (fun x -> 1. - x)
-            1. - (List.reduce (*) probs)
+            1. - (List.reduce (*) inversedProbs)
 
 module DynamicSchedulerPolicies =
     open ComplexSchedulers
@@ -1349,12 +1484,14 @@ module DynamicSchedulerPolicies =
             [ prevSuccessRate; coopWithRunningFunctionsProbability; similarityScoreProb ]
             |> ProbabilityUtils.unionOfIndependentEvents
 
+        let neutralityStart = 0.4
+        let neutralityEnd   = 0.3
         match prob with
         | x when x > 1.0 -> failwith "Probability of context-based policy was calculated more than 1."
         | x when x < 0.  -> failwith "Probability of context-based policy was calculated less than 0."
-        | x when x >= 0.45 || x <= 0.55 -> Neutral
-        | x when x >= 0.55 -> WaitMore ((x - 0.55) / 3.)
-        | x when x <= 0.45 -> WaitLess ((0.45 - x) / 3.)
+        | x when x >= neutralityStart || x <= neutralityEnd -> Neutral
+        | x when x >= neutralityEnd -> WaitMore ((x - neutralityEnd) / 3.)
+        | x when x <= neutralityStart -> WaitLess ((neutralityStart - x) / 3.)
         | x ->
             printfn $"prev success rate: {prevSuccessRate}"
             printfn $"coopWithRunningFunctionsProbability: {coopWithRunningFunctionsProbability}"
@@ -1368,6 +1505,7 @@ module AllSchedulers =
     let random240_50MeanWaitScheduler = BasicSchedulers.randomWaitScheduler 240<second> 50<second>
     let dynamicNeutralScheduler = ComplexSchedulers.dynamicWaitScheduler DynamicSchedulerPolicies.alwaysNeturalPolicy None
     let dynamicContextScheduler = ComplexSchedulers.dynamicWaitScheduler DynamicSchedulerPolicies.contextBasedPolicy None
+    let sandScheduler = SandScheduler.defaultSandScheduler
 
 module EvaluatorConfigs =
     open QueueDataGenerator
@@ -1421,23 +1559,23 @@ module SimulatorContextBatchQoS =
         let tm, ts = scbqos.turnaroundTime
         printfn $"Turnaround Time: {tm}s, stddev: {ts}s"
         let cm, cs = scbqos.cost
-        printfn $"Cost: ${cm}, stddev: ${us}"
+        printfn $"Cost: ${cm}, stddev: ${cs}"
 
-    let utilizationChartData scbqos =
+    let utilizationChartData range scbqos =
         let m, s = scbqos.utilization
-        [ for x in 0. ..0.1.. 100 -> (x, Normal.PDF(m, s, x)) ]
+        [ for x in range -> (x, Normal.PDF(m, s, x)) ]
 
-    let responseTimeChartData scbqos =
+    let responseTimeChartData range scbqos =
         let m, s = scbqos.responseTime
-        [ for x in 0. ..0.1.. 200. -> (x, Normal.PDF(float m, float s, x)) ]
+        [ for x in range -> (x, Normal.PDF(float m, float s, x)) ]
 
-    let turnaroundTimeChartData scbqos =
+    let turnaroundTimeChartData range scbqos =
         let m, s = scbqos.turnaroundTime
-        [ for x in 0. ..0.1.. 100. -> (x, Normal.PDF(float m, float s, x)) ]
+        [ for x in range -> (x, Normal.PDF(float m, float s, x)) ]
 
-    let costChartData scbqos =
+    let costChartData range scbqos =
         let m, s = scbqos.cost
-        [ for x in 0. .. 0.01 .. 4. -> (x, Normal.PDF(float m, float s, x)) ]
+        [ for x in range -> (x, Normal.PDF(float m, float s, x)) ]
 
 module SimulatorContextBatch =
     
@@ -1448,10 +1586,10 @@ module SimulatorContextBatch =
         
         let qosCollected = qosListPerCtx |> List.collect id
 
-        let (uMean, uStddev) = qosCollected |> List.map (fun x -> x.utilization) |> Statistics.MeanStandardDeviation
-        let (rMean, rStddev) = qosCollected |> List.map (fun x -> x.responseTime.TotalSeconds) |> Statistics.MeanStandardDeviation |> (fun (a, b) -> a * 1.<second> , b * 1.<second>)
-        let (tMean, tStddev) = qosCollected |> List.map (fun x -> x.turnaroundTime.TotalSeconds) |> Statistics.MeanStandardDeviation |> (fun (a, b) -> a * 1.<second> , b * 1.<second>)
-        let (costMean, costStddev) = costs |> List.map float |> Statistics.MeanStandardDeviation |> (fun (a, b) -> a * 1.<usd> , b * 1.<usd>)
+        let struct (uMean, uStddev) = qosCollected |> List.map (fun x -> x.utilization) |> Statistics.MeanStandardDeviation
+        let struct (rMean, rStddev) = qosCollected |> List.map (fun x -> x.responseTime.TotalSeconds) |> Statistics.MeanStandardDeviation |> (fun struct (a, b) -> a * 1.<second> , b * 1.<second>)
+        let struct (tMean, tStddev) = qosCollected |> List.map (fun x -> x.turnaroundTime.TotalSeconds) |> Statistics.MeanStandardDeviation |> (fun struct (a, b) -> a * 1.<second> , b * 1.<second>)
+        let struct (costMean, costStddev) = costs |> List.map float |> Statistics.MeanStandardDeviation |> (fun struct (a, b) -> a * 1.<usd> , b * 1.<usd>)
 
         {
             utilization = uMean, uStddev
@@ -1483,7 +1621,8 @@ module SimulationRunnerEngine =
         doForScheduler AllSchedulers.static5MinWaitScheduler,
         doForScheduler AllSchedulers.random240_50MeanWaitScheduler,
         doForScheduler AllSchedulers.dynamicNeutralScheduler,
-        doForScheduler AllSchedulers.dynamicContextScheduler
+        doForScheduler AllSchedulers.dynamicContextScheduler,
+        doForScheduler AllSchedulers.sandScheduler
 
     let functionCountSpan = [2..30]
 
