@@ -7,6 +7,7 @@ open System.Collections.Generic
 #r "nuget: MathNet.Numerics"
 #r "nuget: MathNet.Numerics.FSharp"
 #r "nuget: Dijkstra.NET"
+#r "nuget: FSharp.SystemTextJson"
 
 open NodaTime
 open System.Text.Json
@@ -59,6 +60,7 @@ module General =
     let FunctionSimilarity_TopNCommonDependencies = 10
 
     let PackageRestoreSpeed = 0.1<second/megabyte>
+    let ProcessForkSpeedMemPage = 0.01<second/megabyte>
 
     let PurgeMergeStatusesBeforeInHours = 1.<hour>
 
@@ -87,6 +89,18 @@ module General =
 
     let calculateRestorationDuration (size: float<dbyte>) =
         size |> calculateRestorationTime |> int64 |> Duration.FromSeconds
+
+    let caluclateForkTime (size: float<dbyte>) =
+        let mb = bytesToMegabytes size
+        let sec = ProcessForkSpeedMemPage * mb
+
+        let strippedSec = float sec 
+
+        strippedSec |> ceil |> int64 |> (*) 1L<second>
+
+    let calculateForkDuration size =
+        size |> caluclateForkTime |> int64 |> Duration.FromSeconds
+        
 
 module NodaTimeUtils =
     open NodaTime
@@ -373,6 +387,20 @@ module ServerlessFunction =
         |> List.map (fun x -> x.install.bytes)
         |> List.sum
         |> (*) 1<dbyte>
+
+    let getDepsStringListSize deps =
+        deps
+        |> List.map PackagesData.getFullPackageDataSafe 
+        |> List.map (fun x -> x.install.bytes)
+        |> List.sum
+        |> (*) 1<dbyte>
+
+    let getDepsStringForkDuration deps =
+        deps
+        |> getDepsStringListSize
+        |> float
+        |> (*) 1.0<dbyte>
+        |> General.calculateForkDuration
 
     let getDepsListNonCachedDependencySize (cachedFuncDeps: string list) (currentFunctionDeps: string list) =
         let notCachedDeps = DSExtensions.listSubtract currentFunctionDeps cachedFuncDeps
@@ -811,12 +839,13 @@ module DependencyGraph =
 type MergeStatusKind = SuccessfulMerge | FailedMerge
 type MergeStatus = MergeStatusKind * LocalTime
 
+[<JsonFSharpConverter>]
 type SimulatorContext = {
     day: string
     events: TimelineEvent list
     containerIdCounter: uint
     containers: Map<string, Container>
-    dependencyGraph: DependencyGraph
+    [<JsonIgnore>]dependencyGraph: DependencyGraph
     functionsMergeStatuses: Map<uint, MergeStatus list>
     finalizeReached: bool
 }
@@ -1340,11 +1369,14 @@ module SandScheduler =
         funcToAppIdMapper: uint -> uint
         appFunctionCache: uint -> string list
         cacheFunctionForContainer: uint -> string list -> unit
+        appInitialized : uint -> bool
+        generateNewProcessId: uint -> uint
     }
 
-    let defaultSchedulerDataStorage () =
+    let createDefaultSchedulerDataStorage () =
         let FUNCTION_PER_APP = 3u
         let cache = Dictionary<uint, HashSet<string>>()
+        let processIds = Dictionary<uint, uint>()
 
         {
             funcToAppIdMapper = fun fId -> fId / FUNCTION_PER_APP
@@ -1354,6 +1386,14 @@ module SandScheduler =
                     for dep in deps do cache[appId].Add(dep) |> ignore
                 else
                     cache.Add(appId, HashSet(deps))
+            appInitialized = fun appId -> cache.ContainsKey appId
+            generateNewProcessId = fun appId ->
+                if processIds.ContainsKey appId then
+                    processIds[appId] <- processIds[appId] + 1u
+                    processIds[appId]
+                else
+                    processIds.Add(appId, 0u)
+                    0u
         }
 
     // groups functions to some apps, then isolate apps and run same-app functions together
@@ -1364,16 +1404,17 @@ module SandScheduler =
         | QueueRequest qfr ->
             let f = qfr.concreteFunc()
             let appId = schdata.funcToAppIdMapper f.id
-            let mountConts = ctx |> SimulatorContext.getContainerByName $"app-{appId}"
-            match mountConts with
-            | None ->
+            let isAppCreated = schdata.appInitialized appId
+            let newProcessId = schdata.generateNewProcessId appId
+            match isAppCreated with
+            | false ->
                 let restoreDuration =  ServerlessFunction.fullRestorationDuration f
                 schdata.cacheFunctionForContainer appId f.deps
                 let containerCreationDuration = Container.randomCreationDuration()
                 let lifetimeDuration = containerCreationDuration + restoreDuration + qfr.serviceTime
                 let functionFinish = time.PlusNanoseconds(lifetimeDuration.ToInt64Nanoseconds())
                 let newProcess = {
-                    name = $"app-%d{appId}"
+                    name = $"app-%d{appId}-%d{newProcessId}"
                     id = ctx.containerIdCounter
                     runningFunction = Some f
                     created = time
@@ -1396,17 +1437,19 @@ module SandScheduler =
                         kind = FinishRunningFunction newProcess
                     }
                 }
-            | Some host ->
-                let restorationTime = f.deps |> ServerlessFunction.nonCachedDepsListRestorationDuration (schdata.appFunctionCache appId)
+            | true ->
+                let cache = schdata.appFunctionCache appId
+                let restorationTime = f.deps |> ServerlessFunction.nonCachedDepsListRestorationDuration cache
                 schdata.cacheFunctionForContainer appId f.deps
-                let lifetimeDuration = restorationTime + qfr.serviceTime
+                let forkTime = List.append f.deps cache |> ServerlessFunction.getDepsStringForkDuration
+                let lifetimeDuration = forkTime + restorationTime + qfr.serviceTime
                 let functionFinish = time.PlusNanoseconds(lifetimeDuration.ToInt64Nanoseconds())
                 let newProcess = {
-                    name = $"app-%d{appId}"
+                    name = $"app-%d{appId}-%d{newProcessId}"
                     id = ctx.containerIdCounter
                     runningFunction = Some f
                     created = time
-                    creationDuration = Duration.Zero
+                    creationDuration = forkTime
                     finishedExecTime = None
                     disposed = None
                     totalRestorationDuration = restorationTime
@@ -1428,19 +1471,18 @@ module SandScheduler =
 
 
         | FinishRunningFunction cont ->
-            let newKey = Guid.NewGuid()
-            let newCont = {
-                cont with
-                    finishedExecTime = Some time
-                    mountKey = newKey
-            }
+            
+            let newCont = cont |>  Container.terminate time
+            
             { ctx with
                 containers = ctx.containers |> Map.add newCont.name newCont
             }
         | FinalizeSimulation -> { ctx with finalizeReached = true }
         | _ -> ctx
 
-    let defaultSandScheduler = genericSandScheduler defaultSchedulerDataStorage
+    let defaultSandSchedulerCreator () = 
+        let storage = createDefaultSchedulerDataStorage()
+        genericSandScheduler (fun () -> storage)
 
 module BeyondLBScheduler =
     // biggest package on machine
@@ -1505,7 +1547,7 @@ module AllSchedulers =
     let random240_50MeanWaitScheduler = BasicSchedulers.randomWaitScheduler 240<second> 50<second>
     let dynamicNeutralScheduler = ComplexSchedulers.dynamicWaitScheduler DynamicSchedulerPolicies.alwaysNeturalPolicy None
     let dynamicContextScheduler = ComplexSchedulers.dynamicWaitScheduler DynamicSchedulerPolicies.contextBasedPolicy None
-    let sandScheduler = SandScheduler.defaultSandScheduler
+    let sandSchedulerFactory = SandScheduler.defaultSandSchedulerCreator
 
 module EvaluatorConfigs =
     open QueueDataGenerator
@@ -1606,23 +1648,24 @@ module SimulationRunnerEngine =
 
     let genQueue = generateFunctionQueueData
     let runSim = runSimulatonWithQueueData "saturday"
-    let runBatch (iteration: int) queueRequests scheduler =
+    let runBatch (iteration: int) queueRequests createScheduler =
         let rec run iterId contextList =
             match iterId with
             | x when x = iteration -> contextList
             | y ->
+                let scheduler = createScheduler ()
                 let newContextList = contextList@[runSim queueRequests scheduler]
                 run (iterId + 1) newContextList
 
         run 1 []
     let qosOf = SimulatorContextBatch.getBatchQoS
-    let forAllSchedulers (doForScheduler: Scheduler -> 'a) =
-        doForScheduler AllSchedulers.noMergeScheduler,
-        doForScheduler AllSchedulers.static5MinWaitScheduler,
-        doForScheduler AllSchedulers.random240_50MeanWaitScheduler,
-        doForScheduler AllSchedulers.dynamicNeutralScheduler,
-        doForScheduler AllSchedulers.dynamicContextScheduler,
-        doForScheduler AllSchedulers.sandScheduler
+    let forAllSchedulers (doForScheduler: (unit -> Scheduler) -> 'a) =
+        doForScheduler (fun () -> AllSchedulers.noMergeScheduler),
+        doForScheduler (fun () -> AllSchedulers.static5MinWaitScheduler),
+        doForScheduler (fun () -> AllSchedulers.random240_50MeanWaitScheduler),
+        doForScheduler (fun () -> AllSchedulers.dynamicNeutralScheduler),
+        doForScheduler (fun () -> AllSchedulers.dynamicContextScheduler),
+        doForScheduler AllSchedulers.sandSchedulerFactory
 
     let functionCountSpan = [2..30]
 
